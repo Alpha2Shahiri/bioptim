@@ -122,6 +122,8 @@ def main():
     sol.print_cost()
     sol.animate(n_frames=100)
 
+    print("Hello")
+
 
 if __name__ == "__main__":
     main()
