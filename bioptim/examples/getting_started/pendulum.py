@@ -9,7 +9,9 @@ During the optimization process, the graphs are updated real-time (even though i
 appreciate it). Finally, once it finished optimizing, it animates the model using the optimal solution
 """
 import platform
-
+from casadi import MX, acos, dot, pi
+import numpy as np
+import biorbd_casadi as biorbd
 from bioptim import (
     OptimalControlProgram,
     DynamicsFcn,
@@ -21,10 +23,20 @@ from bioptim import (
     OdeSolver,
     OdeSolverBase,
     CostType,
+    PenaltyController,
     Solver,
     BiorbdModel,
 )
 
+def custom_func_track_markers(controller: PenaltyController) -> MX:
+
+    variable_1 = controller.model.markers(controller.states["qdot"].mx)
+    variable_2 = controller.model.markers(controller.controls["tau"].mx)
+
+    markers_diff = markers[marker_1_idx] - markers[marker_0_idx]
+        markers_diff = controller.mx_to_cx("markers", markers_diff, controller.states["q"])
+
+    return markers_diff
 
 def prepare_ocp(
     biorbd_model_path: str,
