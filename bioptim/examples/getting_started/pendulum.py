@@ -9,9 +9,8 @@ During the optimization process, the graphs are updated real-time (even though i
 appreciate it). Finally, once it finished optimizing, it animates the model using the optimal solution
 """
 import platform
-from casadi import MX, acos, dot, pi
-import numpy as np
-import biorbd_casadi as biorbd
+import casadi
+
 from bioptim import (
     OptimalControlProgram,
     DynamicsFcn,
@@ -19,24 +18,21 @@ from bioptim import (
     Bounds,
     InitialGuess,
     ObjectiveFcn,
-    Objective,
+    ObjectiveList,
     OdeSolver,
     OdeSolverBase,
     CostType,
     PenaltyController,
     Solver,
     BiorbdModel,
+    Node,
 )
 
-def custom_func_track_markers(controller: PenaltyController) -> MX:
+def compute_power(controller: PenaltyController):
+    variable_1 =controller.mx_to_cx("markers", controller.model.markers, controller.states["qdot"])
+    variable_2 =controller.mx_to_cx("markers", controller.model.markers, controller.controls["tau"])
 
-    variable_1 = controller.model.markers(controller.states["qdot"].mx)
-    variable_2 = controller.model.markers(controller.controls["tau"].mx)
-
-    markers_diff = markers[marker_1_idx] - markers[marker_0_idx]
-        markers_diff = controller.mx_to_cx("markers", markers_diff, controller.states["q"])
-
-    return markers_diff
+    return variable_2
 
 def prepare_ocp(
     biorbd_model_path: str,
@@ -77,8 +73,15 @@ def prepare_ocp(
     bio_model = BiorbdModel(biorbd_model_path)
 
     # Add objective functions
-    objective_functions = Objective(ObjectiveFcn.Lagrange.MINIMIZE_CONTROL, key="tau")
-
+    objective_functions = ObjectiveList()
+    # objective_functions.add(ObjectiveFcn.Lagrange.MINIMIZE_CONTROL, key="tau")
+    objective_functions.add(
+        compute_power,
+        custom_type=ObjectiveFcn.Mayer,
+        node=Node.ALL,
+        quadratic=True,
+    )
+    
     # Dynamics
     dynamics = Dynamics(DynamicsFcn.TORQUE_DRIVEN)
 
