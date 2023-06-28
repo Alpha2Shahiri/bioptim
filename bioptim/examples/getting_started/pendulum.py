@@ -32,7 +32,9 @@ def compute_power(controller: PenaltyController):
     variable_1 =controller.mx_to_cx("markers", controller.model.markers, controller.states["qdot"])
     variable_2 =controller.mx_to_cx("markers", controller.model.markers, controller.controls["tau"])
 
-    return variable_2
+    P=casadi.fabs(variable_2*variable_1)
+
+    return P
 
 def prepare_ocp(
     biorbd_model_path: str,
