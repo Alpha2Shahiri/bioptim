@@ -40,6 +40,7 @@ def compute_power(controller: PenaltyController, segment_name:str, method: int):
 
     segment_idx = controller.get_nlp.model.segment_index(segment_name)
     segments_qdot = controller.states["qdot"].cx[segment_idx]
+
     segments_tau = controller.controls["tau"].cx[segment_idx]
 
     Power= segments_tau * segments_qdot
