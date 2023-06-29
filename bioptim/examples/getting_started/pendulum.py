@@ -28,19 +28,29 @@ from bioptim import (
     Node,
 )
 
-def compute_power(controller: PenaltyController):
-    variable_1 =controller.mx_to_cx("markers", controller.model.markers, controller.states["qdot"])
-    variable_2 =controller.mx_to_cx("markers", controller.model.markers, controller.controls["tau"])
+# def compute_power(controller: PenaltyController):
+#     variable_1 =controller.mx_to_cx("markers", controller.model.markers, controller.states["qdot"])
+#     variable_2 =controller.mx_to_cx("markers", controller.model.markers, controller.controls["tau"])
+#
+#     P=casadi.fabs(variable_2*variable_1)
+#
+#     return P
 
-    P=casadi.fabs(variable_2*variable_1)
+def compute_power(controller: PenaltyController, segment_name:str, method: int):
 
-    return P
+    segment_idx = controller.get_nlp.model.segment_index(segment_name)
+    segments_qdot = controller.states["qdot"].cx[segment_idx]
+    segments_tau = controller.controls["tau"].cx[segment_idx]
+
+    Power= segments_tau * segments_qdot
+
+    return Power
 
 def prepare_ocp(
     biorbd_model_path: str,
     final_time: float,
     n_shooting: int,
-    ode_solver: OdeSolverBase = OdeSolver.RK4(),
+    ode_solver: OdeSolverBase = OdeSolver.COLLOCATION(polynomial_degree=4),
     use_sx: bool = True,
     n_threads: int = 1,
     assume_phase_dynamics: bool = True,
@@ -76,12 +86,14 @@ def prepare_ocp(
 
     # Add objective functions
     objective_functions = ObjectiveList()
-    # objective_functions.add(ObjectiveFcn.Lagrange.MINIMIZE_CONTROL, key="tau")
+    # objective_functions.add(ObjectiveFcn.Lagrange.MINIMIZE_CONTROL, key="tau", weight=10)
     objective_functions.add(
         compute_power,
-        custom_type=ObjectiveFcn.Mayer,
+        segment_name="Seg1",
+        custom_type=ObjectiveFcn.Lagrange,
         node=Node.ALL,
         quadratic=True,
+        method=1,
     )
     
     # Dynamics
@@ -146,7 +158,7 @@ def main():
     # --- Show the results in a bioviz animation --- #
     sol.detailed_cost_values()
     sol.print_cost()
-    sol.animate(n_frames=100)
+    sol.animate(n_frames=500)
 
 
 if __name__ == "__main__":
