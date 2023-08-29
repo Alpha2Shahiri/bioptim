@@ -15,8 +15,8 @@ from bioptim import (
     OptimalControlProgram,
     DynamicsFcn,
     Dynamics,
-    Bounds,
-    InitialGuess,
+    BoundsList,
+    InitialGuessList,
     ObjectiveFcn,
     ObjectiveList,
     OdeSolver,
@@ -25,7 +25,11 @@ from bioptim import (
     PenaltyController,
     Solver,
     BiorbdModel,
+<<<<<<< HEAD
     Node,
+=======
+    ControlType,
+>>>>>>> master
 )
 
 # def compute_power(controller: PenaltyController):
@@ -55,6 +59,8 @@ def prepare_ocp(
     use_sx: bool = True,
     n_threads: int = 1,
     assume_phase_dynamics: bool = True,
+    expand_dynamics: bool = True,
+    control_type: ControlType = ControlType.CONSTANT,
 ) -> OptimalControlProgram:
     """
     The initialization of an ocp
@@ -77,6 +83,10 @@ def prepare_ocp(
         If the dynamics equation within a phase is unique or changes at each node. True is much faster, but lacks the
         capability to have changing dynamics within a phase. A good example of when False should be used is when
         different external forces are applied at each node
+    expand_dynamics: bool
+        If the dynamics function should be expanded. Please note, this will solve the problem faster, but will slow down
+        the declaration of the OCP, so it is a trade-off. Also depending on the solver, it may or may not work
+        (for instance IRK is not compatible with expanded dynamics)
 
     Returns
     -------
@@ -98,25 +108,30 @@ def prepare_ocp(
     )
     
     # Dynamics
-    dynamics = Dynamics(DynamicsFcn.TORQUE_DRIVEN)
+    dynamics = Dynamics(DynamicsFcn.TORQUE_DRIVEN, expand=expand_dynamics)
 
     # Path constraint
-    x_bounds = bio_model.bounds_from_ranges(["q", "qdot"])
-    x_bounds[:, [0, -1]] = 0
-    x_bounds[1, -1] = 3.14
+    x_bounds = BoundsList()
+    x_bounds["q"] = bio_model.bounds_from_ranges("q")
+    x_bounds["q"][:, [0, -1]] = 0  # Start and end at 0...
+    x_bounds["q"][1, -1] = 3.14  # ...but end with pendulum 180 degrees rotated
+    x_bounds["qdot"] = bio_model.bounds_from_ranges("qdot")
+    x_bounds["qdot"][:, [0, -1]] = 0  # Start and end without any velocity
 
-    # Initial guess
-    n_q = bio_model.nb_q
-    n_qdot = bio_model.nb_qdot
-    x_init = InitialGuess([0] * (n_q + n_qdot))
+    # Initial guess (optional since it is 0, we show how to initialize anyway)
+    x_init = InitialGuessList()
+    x_init["q"] = [0] * bio_model.nb_q
+    x_init["qdot"] = [0] * bio_model.nb_qdot
 
     # Define control path constraint
     n_tau = bio_model.nb_tau
-    tau_min, tau_max, tau_init = -100, 100, 0
-    u_bounds = Bounds([tau_min] * n_tau, [tau_max] * n_tau)
-    u_bounds[1, :] = 0  # Prevent the model from actively rotate
+    u_bounds = BoundsList()
+    u_bounds["tau"] = [-100] * n_tau, [100] * n_tau  # Limit the strength of the pendulum to (-100 to 100)...
+    u_bounds["tau"][1, :] = 0  # ...but remove the capability to actively rotate
 
-    u_init = InitialGuess([tau_init] * n_tau)
+    # Initial guess (optional since it is 0, we show how to initialize anyway)
+    u_init = InitialGuessList()
+    u_init["tau"] = [0] * n_tau
 
     return OptimalControlProgram(
         bio_model,
@@ -132,6 +147,7 @@ def prepare_ocp(
         use_sx=use_sx,
         n_threads=n_threads,
         assume_phase_dynamics=assume_phase_dynamics,
+        control_type=control_type,
     )
 
 
@@ -141,7 +157,7 @@ def main():
     """
 
     # --- Prepare the ocp --- #
-    ocp = prepare_ocp(biorbd_model_path="models/pendulum.bioMod", final_time=1, n_shooting=30)
+    ocp = prepare_ocp(biorbd_model_path="models/pendulum.bioMod", final_time=1, n_shooting=30, n_threads=2)
 
     # Custom plots
     ocp.add_plot_penalty(CostType.ALL)
@@ -154,10 +170,9 @@ def main():
 
     # --- Solve the ocp --- #
     sol = ocp.solve(Solver.IPOPT(show_online_optim=platform.system() == "Linux"))
-    # sol.graphs()
+    # sol.graphs(show_bounds=True)
 
     # --- Show the results in a bioviz animation --- #
-    sol.detailed_cost_values()
     sol.print_cost()
     sol.animate(n_frames=500)
 

@@ -16,13 +16,16 @@ from bioptim import (
     DynamicsList,
     DynamicsFcn,
     BoundsList,
-    InitialGuessList,
     Solver,
 )
 
 
 def prepare_ocp(
-    biorbd_model_path: str, final_time: float, n_shooting: int, use_sx: bool = True
+    biorbd_model_path: str,
+    final_time: float,
+    n_shooting: int,
+    use_sx: bool = True,
+    expand_dynamics: bool = True,
 ) -> OptimalControlProgram:
     """
     The initialization of an ocp
@@ -64,26 +67,21 @@ def prepare_ocp(
 
     # Dynamics
     dynamics = DynamicsList()
-    dynamics.add(DynamicsFcn.TORQUE_DRIVEN)
+    dynamics.add(DynamicsFcn.TORQUE_DRIVEN, expand=expand_dynamics)
 
     # Path constraint
     x_bounds = BoundsList()
-    x_bounds.add(bounds=bio_model.bounds_from_ranges(["q", "qdot"]))
-    x_bounds[0][:, 0] = 0
-
-    # Initial guess
-    x_init = InitialGuessList()
-    x_init.add([0] * (nq + nqdot))
+    x_bounds["q"] = bio_model.bounds_from_ranges("q")
+    x_bounds["q"][:, 0] = 0
+    x_bounds["qdot"] = bio_model.bounds_from_ranges("qdot")
+    x_bounds["qdot"][:, 0] = 0
 
     # Define control path constraint
     n_tau = bio_model.nb_tau
-    torque_min, torque_max, torque_init = -300, 300, 0
+    torque_min, torque_max = -300, 300
     u_bounds = BoundsList()
-    u_bounds.add([torque_min] * n_tau, [torque_max] * n_tau)
-    u_bounds[0][n_tau - 1, :] = 0
-
-    u_init = InitialGuessList()
-    u_init.add([torque_init] * n_tau)
+    u_bounds["tau"] = [torque_min] * n_tau, [torque_max] * n_tau
+    u_bounds["tau"][-1, :] = 0
 
     # ------------- #
 
@@ -92,11 +90,9 @@ def prepare_ocp(
         dynamics,
         n_shooting,
         final_time,
-        x_init,
-        u_init,
-        x_bounds,
-        u_bounds,
-        objective_functions,
+        x_bounds=x_bounds,
+        u_bounds=u_bounds,
+        objective_functions=objective_functions,
         use_sx=use_sx,
         assume_phase_dynamics=True,
     )

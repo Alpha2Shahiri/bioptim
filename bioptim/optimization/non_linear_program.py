@@ -5,12 +5,15 @@ from casadi import SX, MX, Function, horzcat
 
 from .optimization_variable import OptimizationVariable, OptimizationVariableContainer
 from ..dynamics.ode_solver import OdeSolver
-from ..limits.path_conditions import Bounds, InitialGuess, BoundsList
+from ..limits.path_conditions import InitialGuessList, BoundsList
 from ..misc.enums import ControlType
 from ..misc.options import OptionList
 from ..misc.mapping import NodeMapping
 from ..dynamics.dynamics_evaluation import DynamicsEvaluation
 from ..interfaces.biomodel import BioModel
+from ..interfaces.holonomic_biomodel import HolonomicBioModel
+from ..interfaces.variational_biomodel import VariationalBioModel
+from ..interfaces.stochastic_bio_model import StochasticBioModel
 
 
 class NonLinearProgram:
@@ -51,7 +54,7 @@ class NonLinearProgram:
         All the objectives at each of the node of the phase
     J_internal: list[list[Objective]]
         All the objectives internally defined by the phase at each of the node of the phase
-    model: BiorbdModel | BioModel
+    model: BiorbdModel | BioModel | StochasticBioModel | HolonomicBioModel | VariationalBioModel
         The biorbd model associated with the phase
     n_threads: int
         The number of thread to use
@@ -93,6 +96,13 @@ class NonLinearProgram:
         The casadi variables for the integration at each node of the phase
     states: OptimizationVariableContainer
         A list of all the state variables
+    s_bounds = Bounds()
+        The bounds for the stochastic variables
+    s_init = InitialGuess()
+        The initial guess for the stochastic variables
+    S: list[MX | SX]
+        The casadi variables for the stochastic variables
+
 
     Methods
     -------
@@ -116,10 +126,13 @@ class NonLinearProgram:
         self.control_type = ControlType.NONE
         self.cx = None
         self.dt = None
-        self.dynamics = []
+        self.dynamics = (
+            None  # TODO Change this to a list to include extra_dynamics in a single vector (that matches dynamics_func)
+        )
+        self.extra_dynamics = []
         self.dynamics_evaluation = DynamicsEvaluation()
-        self.dynamics_func = None
-        self.implicit_dynamics_func = None
+        self.dynamics_func: list = []
+        self.implicit_dynamics_func: list = []
         self.dynamics_type = None
         self.external_forces: list[Any] = []
         self.g = []
@@ -127,7 +140,7 @@ class NonLinearProgram:
         self.g_implicit = []
         self.J = []
         self.J_internal = []
-        self.model: BioModel | None = None
+        self.model: BioModel | StochasticBioModel | HolonomicBioModel | VariationalBioModel | None = None
         self.n_threads = None
         self.ns = None
         self.ode_solver = OdeSolver.RK4()
@@ -141,23 +154,30 @@ class NonLinearProgram:
         self.tf = None
         self.t_initial_guess = None
         self.variable_mappings = {}
-        self.u_bounds = Bounds()
-        self.u_init = InitialGuess()
+        self.u_bounds = BoundsList()
+        self.u_init = InitialGuessList()
         self.U_scaled = None
         self.u_scaling = None
         self.U = None
         self.use_states_from_phase_idx = NodeMapping()
         self.use_controls_from_phase_idx = NodeMapping()
         self.use_states_dot_from_phase_idx = NodeMapping()
-        self.x_bounds = Bounds()
-        self.x_init = InitialGuess()
+        self.x_bounds = BoundsList()
+        self.x_init = InitialGuessList()
         self.X_scaled = None
         self.x_scaling = None
         self.X = None
+        self.s_bounds = BoundsList()
+        self.s_init = InitialGuessList()
+        self.S = None
+        self.S_scaled = None
+        self.s_scaling = None
         self.assume_phase_dynamics = assume_phase_dynamics
         self.states = OptimizationVariableContainer(assume_phase_dynamics)
         self.states_dot = OptimizationVariableContainer(assume_phase_dynamics)
         self.controls = OptimizationVariableContainer(assume_phase_dynamics)
+        self.stochastic_variables = OptimizationVariableContainer(assume_phase_dynamics)
+        self.integrated_values = OptimizationVariableContainer(assume_phase_dynamics)
 
     def initialize(self, cx: Callable = None):
         """
@@ -180,6 +200,8 @@ class NonLinearProgram:
         self.states.initialize_from_shooting(n_shooting=self.ns + 1, cx=self.cx)
         self.states_dot.initialize_from_shooting(n_shooting=self.ns + 1, cx=self.cx)
         self.controls.initialize_from_shooting(n_shooting=self.ns + 1, cx=self.cx)
+        self.stochastic_variables.initialize_from_shooting(n_shooting=self.ns + 1, cx=self.cx)
+        self.integrated_values.initialize_from_shooting(n_shooting=self.ns + 1, cx=self.cx)
 
     @staticmethod
     def add(ocp, param_name: str, param: Any, duplicate_singleton: bool, _type: Any = None, name: str = None):
@@ -256,41 +278,6 @@ class NonLinearProgram:
             setattr(nlp, param_name, param)
         else:
             getattr(nlp, name)[param_name] = param
-
-    @staticmethod
-    def add_path_condition(ocp, var: Any, path_name: str, type_option: Any, type_list: Any):
-        """
-        Interface to add for PathCondition classes
-
-        Parameters
-        ----------
-        ocp: OptimalControlProgram
-            A reference to the ocp
-        var: Any
-            The actual data to store
-        path_name: str
-            The name of the condition ("x_init", "u_bounds", ...)
-        type_option: AnyOption
-            The type of PathCondition
-        type_list: AnyList
-            The type of PathConditionList (must be the same type of path_type_option)
-        """
-
-        setattr(ocp, f"isdef_{path_name}", True)
-        name = type_option.__name__
-        if isinstance(var, type_option):
-            var_tp = type_list()
-            try:
-                if isinstance(var_tp, BoundsList):
-                    var_tp.add(bounds=var)
-                else:
-                    var_tp.add(var)
-            except TypeError:
-                raise RuntimeError(f"{path_name} should be built from a {name} or {name}List")
-            var = var_tp
-        elif not isinstance(var, type_list):
-            raise RuntimeError(f"{path_name} should be built from a {name} or {name}List")
-        NonLinearProgram.add(ocp, path_name, var, False)
 
     def add_casadi_func(self, name: str, function: Callable | SX | MX, *all_param: Any) -> casadi.Function:
         """
@@ -375,6 +362,22 @@ class NonLinearProgram:
             elif not isinstance(func_evaluated, MX):
                 func_evaluated = func_evaluated.to_mx()
         func = Function(name, cx_param, [func_evaluated])
+
+        if expand:
+            try:
+                func = func.expand()
+            except Exception as me:
+                raise RuntimeError(
+                    f"An error occurred while executing the 'expand()' function for {name}. Please review the following "
+                    "casadi error message for more details.\n"
+                    "Several factors could be causing this issue. If you are creating your own casadi function, "
+                    "it is possible that you have free variables. Another possibility, if you are using a predefined "
+                    "function, the error might be due to the inability to use expand=True at all. In that case, try "
+                    "adding expand=False to the dynamics or the penalty.\n"
+                    "Original casadi error message:\n"
+                    f"{me}"
+                )
+
         return func.expand() if expand else func
 
     def node_time(self, node_idx: int):

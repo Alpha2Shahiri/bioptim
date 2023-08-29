@@ -8,12 +8,24 @@ from biorbd_casadi import (
     GeneralizedAcceleration,
 )
 from casadi import SX, MX, vertcat, horzcat, norm_fro
+import numpy as np
 
 from ..misc.utils import check_version
 from ..limits.path_conditions import Bounds
 from ..misc.mapping import BiMapping, BiMappingList
 
 check_version(biorbd, "1.9.9", "1.10.0")
+
+
+def _dof_mapping(key, model, mapping: BiMapping = None) -> dict:
+    if key == "q":
+        return _q_mapping(model, mapping)
+    elif key == "qdot":
+        return _qdot_mapping(model, mapping)
+    elif key == "qddot":
+        return _qddot_mapping(model, mapping)
+    else:
+        raise NotImplementedError("Wrong dof mapping")
 
 
 def _q_mapping(model, mapping: BiMapping = None) -> dict:
@@ -63,7 +75,7 @@ def _qddot_mapping(model, mapping: BiMapping = None) -> dict:
     return mapping
 
 
-def bounds_from_ranges(model, variables: str | list[str, ...], mapping: BiMapping | BiMappingList = None) -> Bounds:
+def bounds_from_ranges(model, key: str, mapping: BiMapping | BiMappingList = None) -> Bounds:
     """
     Generate bounds from the ranges of the model
 
@@ -71,7 +83,7 @@ def bounds_from_ranges(model, variables: str | list[str, ...], mapping: BiMappin
     ----------
     model: bio_model
         such as BiorbdModel or MultiBiorbdModel
-    variables: str | list[str, ...]
+    key: str | list[str, ...]
         The variables to generate the bounds from, such as "q", "qdot", "qddot", or ["q", "qdot"],
     mapping: BiMapping | BiMappingList
         The mapping to use to generate the bounds. If None, the default mapping is built
@@ -81,36 +93,13 @@ def bounds_from_ranges(model, variables: str | list[str, ...], mapping: BiMappin
     Bounds
         The bounds generated from the ranges of the model
     """
-    out = Bounds()
 
-    q_ranges = model.ranges_from_model("q") if "q" in variables else None
-    qdot_ranges = model.ranges_from_model("qdot") if "qdot" in variables else None
-    qddot_ranges = model.ranges_from_model("qddot") if "qddot" in variables else None
+    mapping_tp = _dof_mapping(key, model, mapping)[key]
+    ranges = model.ranges_from_model(key)
 
-    for var in variables:
-        if var == "q":
-            q_mapping = _q_mapping(model, mapping)
-            mapping = q_mapping
-            x_min = [q_ranges[i].min() for i in q_mapping["q"].to_first.map_idx]
-            x_max = [q_ranges[i].max() for i in q_mapping["q"].to_first.map_idx]
-            out.concatenate(Bounds(min_bound=x_min, max_bound=x_max))
-        elif var == "qdot":
-            qdot_mapping = _qdot_mapping(model, mapping)
-            mapping = qdot_mapping
-            x_min = [qdot_ranges[i].min() for i in qdot_mapping["qdot"].to_first.map_idx]
-            x_max = [qdot_ranges[i].max() for i in qdot_mapping["qdot"].to_first.map_idx]
-            out.concatenate(Bounds(min_bound=x_min, max_bound=x_max))
-        elif var == "qddot":
-            qddot_mapping = _qddot_mapping(model, mapping)
-            mapping = qddot_mapping
-            x_min = [qddot_ranges[i].min() for i in qddot_mapping["qddot"].to_first.map_idx]
-            x_max = [qddot_ranges[i].max() for i in qddot_mapping["qddot"].to_first.map_idx]
-            out.concatenate(Bounds(min_bound=x_min, max_bound=x_max))
-
-    if out.shape[0] == 0:
-        raise ValueError(f"Unrecognized variable ({variables}), only 'q', 'qdot' and 'qddot' are allowed")
-
-    return out
+    x_min = [ranges[i].min() for i in mapping_tp.to_first.map_idx]
+    x_max = [ranges[i].max() for i in mapping_tp.to_first.map_idx]
+    return Bounds(key, min_bound=x_min, max_bound=x_max)
 
 
 class BiorbdModel:
@@ -118,11 +107,12 @@ class BiorbdModel:
     This class allows to define a biorbd model.
     """
 
-    def __init__(self, bio_model: str | biorbd.Model):
+    def __init__(self, bio_model: str | biorbd.Model, friction_coefficients: np.ndarray = None):
         if not isinstance(bio_model, str) and not isinstance(bio_model, biorbd.Model):
             raise ValueError("The model should be of type 'str' or 'biorbd.Model'")
 
         self.model = biorbd.Model(bio_model) if isinstance(bio_model, str) else bio_model
+        self.friction_coefficients = friction_coefficients
 
     @property
     def path(self) -> str:
@@ -205,6 +195,15 @@ class BiorbdModel:
         qdot_biorbd = GeneralizedVelocity(qdot)
         qddot_biorbd = GeneralizedAcceleration(qddot)
         return self.model.CoMddot(q_biorbd, qdot_biorbd, qddot_biorbd, True).to_mx()
+
+    def mass_matrix(self, q) -> MX:
+        q_biorbd = GeneralizedCoordinates(q)
+        return self.model.massMatrix(q_biorbd).to_mx()
+
+    def non_linear_effects(self, q, qdot) -> MX:
+        q_biorbd = GeneralizedCoordinates(q)
+        qdot_biorbd = GeneralizedVelocity(qdot)
+        return self.model.NonLinearEffect(q_biorbd, qdot_biorbd).to_mx()
 
     def angular_momentum(self, q, qdot) -> MX:
         q_biorbd = GeneralizedCoordinates(q)
@@ -314,6 +313,14 @@ class BiorbdModel:
             muscle_states[k].setExcitation(muscle_excitations[k])
         return self.model.activationDot(muscle_states).to_mx()
 
+    def muscle_length_jacobian(self, q) -> MX:
+        q_biorbd = GeneralizedCoordinates(q)
+        return self.model.musclesLengthJacobian(q_biorbd).to_mx()
+
+    def muscle_velocity(self, q, qdot) -> MX:
+        J = self.muscle_length_jacobian(q)
+        return J @ qdot
+
     def muscle_joint_torque(self, activations, q, qdot) -> MX:
         muscles_states = self.model.stateSet()
         for k in range(self.model.nbMuscles()):
@@ -322,7 +329,7 @@ class BiorbdModel:
         qdot_biorbd = GeneralizedVelocity(qdot)
         return self.model.muscularJointTorque(muscles_states, q_biorbd, qdot_biorbd).to_mx()
 
-    def markers(self, q) -> Any | list[MX]:
+    def markers(self, q) -> list[MX]:
         return [m.to_mx() for m in self.model.markers(GeneralizedCoordinates(q))]
 
     @property
@@ -371,21 +378,19 @@ class BiorbdModel:
         """
         return self.model.rigidContactAxisIdx(contact_index)
 
-    def marker_velocities(self, q, qdot, reference_index=None) -> MX:
+    def marker_velocities(self, q, qdot, reference_index=None) -> list[MX]:
         if reference_index is None:
-            return horzcat(
-                *[
-                    m.to_mx()
-                    for m in self.model.markersVelocity(
-                        GeneralizedCoordinates(q),
-                        GeneralizedVelocity(qdot),
-                        True,
-                    )
-                ]
-            )
+            return [
+                m.to_mx()
+                for m in self.model.markersVelocity(
+                    GeneralizedCoordinates(q),
+                    GeneralizedVelocity(qdot),
+                    True,
+                )
+            ]
 
         else:
-            out = MX()
+            out = []
             homogeneous_matrix_transposed = self.homogeneous_matrices_in_global(
                 GeneralizedCoordinates(q),
                 reference_index,
@@ -393,7 +398,34 @@ class BiorbdModel:
             )
             for m in self.model.markersVelocity(GeneralizedCoordinates(q), GeneralizedVelocity(qdot)):
                 if m.applyRT(homogeneous_matrix_transposed) is None:
-                    out = horzcat(out, m.to_mx())
+                    out.append(m.to_mx())
+
+            return out
+
+    def marker_accelerations(self, q, qdot, qddot, reference_index=None) -> list[MX]:
+        if reference_index is None:
+            return [
+                m.to_mx()
+                for m in self.model.markerAcceleration(
+                    GeneralizedCoordinates(q),
+                    GeneralizedVelocity(qdot),
+                    GeneralizedAcceleration(qddot),
+                    True,
+                )
+            ]
+
+        else:
+            out = []
+            homogeneous_matrix_transposed = self.homogeneous_matrices_in_global(
+                GeneralizedCoordinates(q),
+                reference_index,
+                inverse=True,
+            )
+            for m in self.model.markersAcceleration(
+                GeneralizedCoordinates(q), GeneralizedVelocity(qdot), GeneralizedAcceleration(qddot)
+            ):
+                if m.applyRT(homogeneous_matrix_transposed) is None:
+                    out.append(m.to_mx())
 
             return out
 
@@ -411,6 +443,9 @@ class BiorbdModel:
         return self.model.rigidContactAcceleration(q_biorbd, qdot_biorbd, qddot_biorbd, contact_index, True).to_mx()[
             contact_axis
         ]
+
+    def markers_jacobian(self, q) -> list[MX]:
+        return [m.to_mx() for m in self.model.markersJacobian(GeneralizedCoordinates(q))]
 
     @property
     def nb_dof(self) -> int:
@@ -520,6 +555,58 @@ class BiorbdModel:
 
     def bounds_from_ranges(self, variables: str | list[str, ...], mapping: BiMapping | BiMappingList = None) -> Bounds:
         return bounds_from_ranges(self, variables, mapping)
+
+    def lagrangian(self, q: MX | SX, qdot: MX | SX) -> MX | SX:
+        q_biorbd = GeneralizedCoordinates(q)
+        qdot_biorbd = GeneralizedVelocity(qdot)
+        return self.model.Lagrangian(q_biorbd, qdot_biorbd).to_mx()
+
+    @staticmethod
+    def animate(
+        solution: Any, show_now: bool = True, tracked_markers: list[np.ndarray, ...] = None, **kwargs: Any
+    ) -> None | list:
+        try:
+            import bioviz
+        except ModuleNotFoundError:
+            raise RuntimeError("bioviz must be install to animate the model")
+
+        check_version(bioviz, "2.3.0", "2.4.0")
+
+        states = solution.states
+        if not isinstance(states, (list, tuple)):
+            states = [states]
+
+        if tracked_markers is None:
+            tracked_markers = [None] * len(states)
+
+        all_bioviz = []
+        for idx_phase, data in enumerate(states):
+            if not isinstance(solution.ocp.nlp[idx_phase].model, BiorbdModel):
+                raise NotImplementedError("Animation is only implemented for biorbd models")
+
+            # This calls each of the function that modify the internal dynamic model based on the parameters
+            nlp = solution.ocp.nlp[idx_phase]
+
+            # noinspection PyTypeChecker
+            biorbd_model: BiorbdModel = nlp.model
+
+            all_bioviz.append(bioviz.Viz(biorbd_model.path, **kwargs))
+            all_bioviz[-1].load_movement(solution.ocp.nlp[idx_phase].variable_mappings["q"].to_second.map(data["q"]))
+
+            if tracked_markers[idx_phase] is not None:
+                all_bioviz[-1].load_experimental_markers(tracked_markers[idx_phase])
+
+        if show_now:
+            b_is_visible = [True] * len(all_bioviz)
+            while sum(b_is_visible):
+                for i, b in enumerate(all_bioviz):
+                    if b.vtk_window.is_active:
+                        b.update()
+                    else:
+                        b_is_visible[i] = False
+            return None
+        else:
+            return all_bioviz
 
 
 class MultiBiorbdModel:
@@ -697,6 +784,21 @@ class MultiBiorbdModel:
                 out,
                 model.center_of_mass_acceleration(q_model, qdot_model, qddot_model),
             )
+        return out
+
+    def mass_matrix(self, q) -> list[MX]:
+        out = []
+        for i, model in enumerate(self.models):
+            q_model = q[self.variable_index("q", i)]
+            out += [model.mass_matrix(q_model)]
+        return out
+
+    def non_linear_effects(self, q, qdot) -> list[MX]:
+        out = []
+        for i, model in enumerate(self.models):
+            q_model = q[self.variable_index("q", i)]
+            qdot_model = qdot[self.variable_index("qdot", i)]
+            out += [model.non_linear_effects(q_model, qdot_model)]
         return out
 
     def angular_momentum(self, q, qdot) -> MX:
@@ -984,16 +1086,15 @@ class MultiBiorbdModel:
             # Note: may not work if the contact_index is not in the first model
         return model_selected.rigid_contact_index(contact_index)
 
-    def marker_velocities(self, q, qdot, reference_index=None) -> MX:
+    def marker_velocities(self, q, qdot, reference_index=None) -> list[MX]:
         if reference_index is not None:
             raise RuntimeError("marker_velocities is not implemented yet with reference_index for MultiBiorbdModel")
 
-        out = MX()
+        out = []
         for i, model in enumerate(self.models):
             q_model = q[self.variable_index("q", i)]
             qdot_model = qdot[self.variable_index("qdot", i)]
-            out = vertcat(
-                out,
+            out.extend(
                 model.marker_velocities(q_model, qdot_model, reference_index),
             )
         return out
@@ -1097,3 +1198,10 @@ class MultiBiorbdModel:
 
     def _qddot_mapping(self, mapping: BiMapping = None) -> dict:
         return _qddot_mapping(self, mapping)
+
+    def lagrangian(self):
+        raise NotImplementedError("lagrangian is not implemented yet for MultiBiorbdModel")
+
+    @staticmethod
+    def animate(solution: Any, show_now: bool = True, tracked_markers: list = None, **kwargs: Any) -> None | list:
+        raise NotImplementedError("animate is not implemented yet for MultiBiorbdModel")

@@ -27,6 +27,7 @@ def prepare_ocp(
     n_shooting: int,
     ode_solver: OdeSolverBase = OdeSolver.RK4(),
     assume_phase_dynamics: bool = True,
+    expand_dynamics: bool = True,
 ) -> OptimalControlProgram:
     """
     Prepare the ocp
@@ -45,6 +46,10 @@ def prepare_ocp(
         If the dynamics equation within a phase is unique or changes at each node. True is much faster, but lacks the
         capability to have changing dynamics within a phase. A good example of when False should be used is when
         different external forces are applied at each node
+    expand_dynamics: bool
+        If the dynamics function should be expanded. Please note, this will solve the problem faster, but will slow down
+        the declaration of the OCP, so it is a trade-off. Also depending on the solver, it may or may not work
+        (for instance IRK is not compatible with expanded dynamics)
 
     Returns
     -------
@@ -68,25 +73,21 @@ def prepare_ocp(
 
     # Dynamics
     dynamics = DynamicsList()
-    expand = False if isinstance(ode_solver, OdeSolver.IRK) else True
-    dynamics.add(DynamicsFcn.TORQUE_DRIVEN, expand=expand)
+    dynamics.add(DynamicsFcn.TORQUE_DRIVEN, expand=expand_dynamics)
 
     # Path constraint
     x_bounds = BoundsList()
-    x_bounds.add(bounds=bio_model.bounds_from_ranges(["q", "qdot"]))
-    x_bounds[0][2, [0, -1]] = [-1.57, 1.57]
-
-    # Initial guess
-    x_init = InitialGuessList()
-    x_init.add([0] * (bio_model.nb_q + bio_model.nb_qdot))
+    x_bounds["q"] = bio_model.bounds_from_ranges("q")
+    x_bounds["q"][2, [0, -1]] = [-1.57, 1.57]
+    x_bounds["qdot"] = bio_model.bounds_from_ranges("qdot")
 
     # Define control path constraint
     tau_min, tau_max, tau_init = -100, 100, 2
     u_bounds = BoundsList()
-    u_bounds.add([tau_min] * bio_model.nb_tau, [tau_max] * bio_model.nb_tau)
+    u_bounds["tau"] = [tau_min] * bio_model.nb_tau, [tau_max] * bio_model.nb_tau
 
     u_init = InitialGuessList()
-    u_init.add([tau_init] * bio_model.nb_tau)
+    u_init["tau"] = [tau_init] * bio_model.nb_tau
 
     # ------------- #
 
@@ -95,11 +96,10 @@ def prepare_ocp(
         dynamics,
         n_shooting,
         final_time,
-        x_init,
-        u_init,
-        x_bounds,
-        u_bounds,
-        objective_functions,
+        x_bounds=x_bounds,
+        u_bounds=u_bounds,
+        u_init=u_init,
+        objective_functions=objective_functions,
         ode_solver=ode_solver,
         assume_phase_dynamics=assume_phase_dynamics,
     )

@@ -15,13 +15,20 @@ from bioptim import (
     DynamicsFcn,
     BoundsList,
     InitialGuessList,
-    InitialGuess,
     Solver,
     InterpolationType,
 )
 
 
-def prepare_ocp(biorbd_model_path, final_time, n_shooting, x_warm=None, use_sx=False, n_threads=1):
+def prepare_ocp(
+    biorbd_model_path,
+    final_time,
+    n_shooting,
+    x_warm=None,
+    use_sx=False,
+    n_threads=1,
+    expand_dynamics=True,
+):
     # --- Options --- #
     # BioModel path
     bio_model = BiorbdModel(biorbd_model_path)
@@ -40,28 +47,31 @@ def prepare_ocp(biorbd_model_path, final_time, n_shooting, x_warm=None, use_sx=F
 
     # Dynamics
     dynamics = DynamicsList()
-    dynamics.add(DynamicsFcn.MUSCLE_DRIVEN, with_residual_torque=True)
+    dynamics.add(DynamicsFcn.MUSCLE_DRIVEN, with_residual_torque=True, expand=expand_dynamics)
 
     # Path constraint
     x_bounds = BoundsList()
-    x_bounds.add(bounds=bio_model.bounds_from_ranges(["q", "qdot"]))
-    x_bounds[0][:, 0] = (1.0, 1.0, 0, 0)
+    x_bounds["q"] = bio_model.bounds_from_ranges("q")
+    x_bounds["q"][:, 0] = 1.0
+    x_bounds["qdot"] = bio_model.bounds_from_ranges("qdot")
+    x_bounds["qdot"][:, 0] = 1.0
 
     # Initial guess
+    x_init = InitialGuessList()
     if x_warm is None:
-        x_init = InitialGuess([1.57] * bio_model.nb_q + [0] * bio_model.nb_qdot)
+        x_init["q"] = [1.57] * bio_model.nb_q
+        x_init["qdot"] = [0] * bio_model.nb_qdot
     else:
-        x_init = InitialGuess(x_warm, interpolation=InterpolationType.EACH_FRAME)
+        x_init.add("q", x_warm[: bio_model.nb_q, :], interpolation=InterpolationType.EACH_FRAME)
+        x_init.add("qdot", x_warm[bio_model.nb_q :], interpolation=InterpolationType.EACH_FRAME)
 
     # Define control path constraint
     u_bounds = BoundsList()
-    u_bounds.add(
-        [tau_min] * bio_model.nb_tau + [muscle_min] * bio_model.nb_muscles,
-        [tau_max] * bio_model.nb_tau + [muscle_max] * bio_model.nb_muscles,
-    )
+    u_bounds["tau"] = [tau_min] * bio_model.nb_tau, [tau_max] * bio_model.nb_tau
+    u_bounds["muscles"] = [muscle_min] * bio_model.nb_muscles, [muscle_max] * bio_model.nb_muscles
 
     u_init = InitialGuessList()
-    u_init.add([tau_init] * bio_model.nb_tau + [muscle_init] * bio_model.nb_muscles)
+    u_init["muscles"] = [muscle_init] * bio_model.nb_muscles
     # ------------- #
 
     return OptimalControlProgram(
@@ -69,11 +79,11 @@ def prepare_ocp(biorbd_model_path, final_time, n_shooting, x_warm=None, use_sx=F
         dynamics,
         n_shooting,
         final_time,
-        x_init,
-        u_init,
-        x_bounds,
-        u_bounds,
-        objective_functions,
+        x_bounds=x_bounds,
+        u_bounds=u_bounds,
+        x_init=x_init,
+        u_init=u_init,
+        objective_functions=objective_functions,
         use_sx=use_sx,
         n_threads=n_threads,
         assume_phase_dynamics=True,

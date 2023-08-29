@@ -1,13 +1,14 @@
 from typing import Callable, Any
 
 import numpy as np
-from casadi import sum1, if_else, vertcat, lt, SX, MX
+from casadi import sum1, if_else, vertcat, lt, SX, MX, jacobian, Function, MX_eye, horzcat
 
 from .path_conditions import Bounds
 from .penalty import PenaltyFunctionAbstract, PenaltyOption, PenaltyController
 from ..misc.enums import Node, InterpolationType, PenaltyType, ConstraintType
 from ..misc.fcn_enum import FcnEnum
 from ..misc.options import OptionList
+from ..interfaces.stochastic_bio_model import StochasticBioModel
 
 
 class Constraint(PenaltyOption):
@@ -29,6 +30,7 @@ class Constraint(PenaltyOption):
         max_bound: np.ndarray | float = None,
         quadratic: bool = False,
         phase: int = -1,
+        is_stochastic: bool = False,
         **params: Any,
     ):
         """
@@ -44,6 +46,9 @@ class Constraint(PenaltyOption):
             The index of the phase to apply the constraint
         quadratic: bool
             If the penalty is quadratic
+        is_stochastic: bool
+            If the constraint is stochastic (if we should instead look at the rate of variation of the inequality
+            constraint)
         params:
             Generic parameters for options
         """
@@ -53,7 +58,12 @@ class Constraint(PenaltyOption):
             constraint = ConstraintFcn.CUSTOM
 
         super(Constraint, self).__init__(
-            penalty=constraint, phase=phase, quadratic=quadratic, custom_function=custom_function, **params
+            penalty=constraint,
+            phase=phase,
+            quadratic=quadratic,
+            custom_function=custom_function,
+            is_stochastic=is_stochastic,
+            **params,
         )
 
         if isinstance(constraint, ImplicitConstraintFcn):
@@ -61,7 +71,7 @@ class Constraint(PenaltyOption):
 
         self.min_bound = min_bound
         self.max_bound = max_bound
-        self.bounds = Bounds(interpolation=InterpolationType.CONSTANT)
+        self.bounds = Bounds("constraints", interpolation=InterpolationType.CONSTANT)
 
     def set_penalty(self, penalty: MX | SX, controller: PenaltyController):
         super(Constraint, self).set_penalty(penalty, controller)
@@ -89,7 +99,7 @@ class Constraint(PenaltyOption):
                     if hasattr(self.max_bound, "__getitem__") and self.max_bound.shape[0] > 1
                     else self.max_bound
                 )
-                self.bounds.concatenate(Bounds(min_bound, max_bound, interpolation=InterpolationType.CONSTANT))
+                self.bounds.concatenate(Bounds(None, min_bound, max_bound, interpolation=InterpolationType.CONSTANT))
         elif self.bounds.shape[0] != len(self.rows):
             raise RuntimeError(f"bounds rows is {self.bounds.shape[0]} but should be {self.rows} or empty")
 
@@ -244,7 +254,10 @@ class ConstraintFunction(PenaltyFunctionAbstract):
             constraint.max_bound = np.array([np.inf, np.inf])
 
             contact = controller.get_nlp.contact_forces_func(
-                controller.states.cx_start, controller.controls.cx_start, controller.parameters.cx_start
+                controller.states.cx_start,
+                controller.controls.cx_start,
+                controller.parameters.cx,
+                controller.stochastic_variables.cx_start,
             )
             normal_contact_force_squared = sum1(contact[normal_component_idx, 0]) ** 2
             if len(tangential_component_idx) == 1:
@@ -575,6 +588,305 @@ class ConstraintFunction(PenaltyFunctionAbstract):
 
             return controller.mx_to_cx("forward_dynamics", controller.controls["fext"].mx - soft_contact_force, *var)
 
+        @staticmethod
+        def stochastic_covariance_matrix_continuity_implicit(
+            penalty: PenaltyOption,
+            controller: PenaltyController,
+        ):
+            """
+            This functions constrain the covariance matrix to its actual value as in Gillis 2013.
+            It is explained in more details here: https://doi.org/10.1109/CDC.2013.6761121
+            P_k+1 = M_k @ (dg/dx @ P @ dg/dx + dg/dw @ sigma_w @ dg/dw) @ M_k
+            """
+            # TODO: Charbie -> This is only True for x=[q, qdot], u=[tau] (have to think on how to generalize it)
+
+            if not controller.get_nlp.is_stochastic:
+                raise RuntimeError("This function is only valid for stochastic problems")
+
+            if "cholesky_cov" in controller.stochastic_variables.keys():
+                l_cov_matrix = StochasticBioModel.reshape_to_cholesky_matrix(
+                    controller.stochastic_variables["cholesky_cov"].cx_start, controller.model.matrix_shape_cov_cholesky
+                )
+                cov_matrix = l_cov_matrix @ l_cov_matrix.T
+            else:
+                cov_matrix = StochasticBioModel.reshape_to_matrix(
+                    controller.stochastic_variables["cov"].cx_start, controller.model.matrix_shape_cov
+                )
+            a_matrix = StochasticBioModel.reshape_to_matrix(
+                controller.stochastic_variables["a"].cx_start, controller.model.matrix_shape_a
+            )
+            c_matrix = StochasticBioModel.reshape_to_matrix(
+                controller.stochastic_variables["c"].cx_start, controller.model.matrix_shape_c
+            )
+            m_matrix = StochasticBioModel.reshape_to_matrix(
+                controller.stochastic_variables["m"].cx_start, controller.model.matrix_shape_m
+            )
+
+            sigma_w = vertcat(
+                controller.model.sensory_noise_magnitude, controller.model.motor_noise_magnitude
+            ) * MX_eye(
+                vertcat(controller.model.sensory_noise_magnitude, controller.model.motor_noise_magnitude).shape[0]
+            )
+            dt = controller.tf / controller.ns
+            dg_dw = -dt * c_matrix
+            dg_dx = -MX_eye(a_matrix.shape[0]) - dt / 2 * a_matrix
+
+            cov_next = m_matrix @ (dg_dx @ cov_matrix @ dg_dx.T + dg_dw @ sigma_w @ dg_dw.T) @ m_matrix.T
+            cov_implicit_deffect = cov_next - cov_matrix
+
+            penalty.expand = controller.get_nlp.dynamics_type.expand
+            penalty.explicit_derivative = True
+            penalty.multi_thread = True
+
+            out_vector = StochasticBioModel.reshape_to_vector(cov_implicit_deffect)
+            return out_vector
+
+        @staticmethod
+        def stochastic_df_dx_implicit(
+            penalty: Constraint,
+            controller: PenaltyController,
+        ):
+            """
+            This function constrains the stochastic matrix A to its actual value which is
+            A = df/dx
+            """
+            if not controller.get_nlp.is_stochastic:
+                raise RuntimeError("This function is only valid for stochastic problems")
+
+            dt = controller.tf / controller.ns
+
+            nb_root = controller.model.nb_root
+            # TODO: Charbie -> This is only True for x=[q, qdot], u=[tau] (have to think on how to generalize it)
+            nu = controller.model.nb_q - controller.model.nb_root
+
+            a_matrix = StochasticBioModel.reshape_to_matrix(
+                controller.stochastic_variables["a"].cx_start, controller.model.matrix_shape_a
+            )
+
+            q_root = MX.sym("q_root", nb_root, 1)
+            q_joints = MX.sym("q_joints", nu, 1)
+            qdot_root = MX.sym("qdot_root", nb_root, 1)
+            qdot_joints = MX.sym("qdot_joints", nu, 1)
+            tau_joints = MX.sym("tau_joints", nu, 1)
+            parameters_sym = MX.sym("parameters_sym", controller.parameters.shape, 1)
+            stochastic_sym = MX.sym("stochastic_sym", controller.stochastic_variables.shape, 1)
+
+            dx = controller.extra_dynamics(0)(
+                vertcat(q_root, q_joints, qdot_root, qdot_joints),  # States
+                tau_joints,
+                parameters_sym,
+                stochastic_sym,
+            )
+
+            non_root_index = list(range(nb_root, nb_root + nu)) + list(
+                range(nb_root + nu + nb_root, nb_root + nu + nb_root + nu)
+            )
+            DF_DX_fun = Function(
+                "DF_DX_fun",
+                [
+                    q_root,
+                    q_joints,
+                    qdot_root,
+                    qdot_joints,
+                    tau_joints,
+                    parameters_sym,
+                    stochastic_sym,
+                    controller.model.motor_noise_sym,
+                    controller.model.sensory_noise_sym,
+                ],
+                [jacobian(dx[non_root_index], vertcat(q_joints, qdot_joints))],
+            )
+
+            DF_DX = DF_DX_fun(
+                controller.states["q"].cx_start[:nb_root],
+                controller.states["q"].cx_start[nb_root:],
+                controller.states["qdot"].cx_start[:nb_root],
+                controller.states["qdot"].cx_start[nb_root:],
+                controller.controls.cx_start,
+                controller.parameters.cx_start,
+                controller.stochastic_variables.cx_start,
+                controller.model.motor_noise_magnitude,
+                controller.model.sensory_noise_magnitude,
+            )
+
+            out = a_matrix - (MX_eye(DF_DX.shape[0]) - DF_DX * dt / 2)
+
+            out_vector = StochasticBioModel.reshape_to_vector(out)
+            return out_vector
+
+        @staticmethod
+        def stochastic_helper_matrix_collocation(
+            penalty: Constraint,
+            controller: PenaltyController,
+        ):
+            """
+            This function constrains the stochastic matrix M to its actual value which is
+            dF/dz.T = dG/dz.T @ M.T
+            where z = states at the collocation points, F = collocation continuity constraint (dxdt - x_k+1),
+            and G = collocation slope constraints (defects).
+            """
+
+            if not controller.get_nlp.is_stochastic:
+                raise RuntimeError("This function is only valid for stochastic problems")
+
+            polynomial_degree = controller.get_nlp.ode_solver.polynomial_degree
+            nb_root = controller.model.nb_root
+            # TODO: Charbie -> This is only True for x=[q, qdot], u=[tau] (have to think on how to generalize it)
+            nu = controller.model.nb_q - controller.model.nb_root
+            non_root_index_continuity = []
+            non_root_index_defects = []
+            for i in range(2):
+                for j in range(polynomial_degree + 1):
+                    non_root_index_defects += list(
+                        range(
+                            (nb_root + nu) * (i * (polynomial_degree + 1) + j) + nb_root,
+                            (nb_root + nu) * (i * (polynomial_degree + 1) + j) + nb_root + nu,
+                        )
+                    )
+                non_root_index_continuity += list(
+                    range((nb_root + nu) * i + nb_root, (nb_root + nu) * i + nb_root + nu)
+                )
+
+            x_q_root = controller.cx.sym("x_q_root", nb_root, 1)
+            x_q_joints = controller.cx.sym("x_q_joints", nu, 1)
+            x_qdot_root = controller.cx.sym("x_qdot_root", nb_root, 1)
+            x_qdot_joints = controller.cx.sym("x_qdot_joints", nu, 1)
+            z_q_root = controller.cx.sym("z_q_root", nb_root, polynomial_degree)
+            z_q_joints = controller.cx.sym("z_q_joints", nu, polynomial_degree)
+            z_qdot_root = controller.cx.sym("z_qdot_root", nb_root, polynomial_degree)
+            z_qdot_joints = controller.cx.sym("z_qdot_joints", nu, polynomial_degree)
+
+            states_full = vertcat(
+                horzcat(x_q_root, z_q_root),
+                horzcat(x_q_joints, z_q_joints),
+                horzcat(x_qdot_root, z_qdot_root),
+                horzcat(x_qdot_joints, z_qdot_joints),
+            )
+
+            dynamics_xf, dynamics_xall, dynamics_defects = controller.integrate_extra_dynamics(0)(
+                states_full,
+                controller.controls.cx_start,
+                controller.parameters.cx_start,
+                controller.stochastic_variables.cx_start,
+            )
+
+            initial_polynomial_evaluation = vertcat(x_q_root, x_q_joints, x_qdot_root, x_qdot_joints)
+            final_polynomial_evaluation = dynamics_xf[non_root_index_continuity]
+            defects = dynamics_defects
+            defects = vertcat(initial_polynomial_evaluation, defects)[non_root_index_defects]
+
+            df_dz = horzcat(
+                jacobian(final_polynomial_evaluation, x_q_joints),
+                jacobian(final_polynomial_evaluation, z_q_joints),
+                jacobian(final_polynomial_evaluation, x_qdot_joints),
+                jacobian(final_polynomial_evaluation, z_qdot_joints),
+            )
+
+            dg_dz = horzcat(
+                jacobian(defects, x_q_joints),
+                jacobian(defects, z_q_joints),
+                jacobian(defects, x_qdot_joints),
+                jacobian(defects, z_qdot_joints),
+            )
+
+            non_sym_states = horzcat(*([controller.states.cx_start] + controller.states.cx_intermediates_list))
+            df_dz_fun = Function(
+                "df_dz",
+                [
+                    x_q_root,
+                    x_q_joints,
+                    x_qdot_root,
+                    x_qdot_joints,
+                    z_q_root,
+                    z_q_joints,
+                    z_qdot_root,
+                    z_qdot_joints,
+                    controller.controls.cx_start,
+                    controller.parameters.cx_start,
+                    controller.stochastic_variables.cx_start,
+                    controller.model.motor_noise_sym,
+                    controller.model.sensory_noise_sym,
+                ],
+                [df_dz],
+            )
+            dg_dz_fun = Function(
+                "dg_dz",
+                [
+                    x_q_root,
+                    x_q_joints,
+                    x_qdot_root,
+                    x_qdot_joints,
+                    z_q_root,
+                    z_q_joints,
+                    z_qdot_root,
+                    z_qdot_joints,
+                    controller.controls.cx_start,
+                    controller.parameters.cx_start,
+                    controller.stochastic_variables.cx_start,
+                    controller.model.motor_noise_sym,
+                    controller.model.sensory_noise_sym,
+                ],
+                [dg_dz],
+            )
+
+            df_dz_evaluated = df_dz_fun(
+                non_sym_states[:nb_root, 0],
+                non_sym_states[nb_root : nb_root + nu, 0],
+                non_sym_states[nb_root + nu : 2 * nb_root + nu, 0],
+                non_sym_states[2 * nb_root + nu :, 0],
+                non_sym_states[:nb_root, 1:],
+                non_sym_states[nb_root : nb_root + nu, 1:],
+                non_sym_states[nb_root + nu : 2 * nb_root + nu, 1:],
+                non_sym_states[2 * nb_root + nu :, 1:],
+                controller.controls.cx_start,
+                controller.parameters.cx_start,
+                controller.stochastic_variables.cx_start,
+                controller.model.motor_noise_magnitude,
+                controller.model.sensory_noise_magnitude,
+            )
+            dg_dz_evaluated = dg_dz_fun(
+                non_sym_states[:nb_root, 0],
+                non_sym_states[nb_root : nb_root + nu, 0],
+                non_sym_states[nb_root + nu : 2 * nb_root + nu, 0],
+                non_sym_states[2 * nb_root + nu :, 0],
+                non_sym_states[:nb_root, 1:],
+                non_sym_states[nb_root : nb_root + nu, 1:],
+                non_sym_states[nb_root + nu : 2 * nb_root + nu, 1:],
+                non_sym_states[2 * nb_root + nu :, 1:],
+                controller.controls.cx_start,
+                controller.parameters.cx_start,
+                controller.stochastic_variables.cx_start,
+                controller.model.motor_noise_magnitude,
+                controller.model.sensory_noise_magnitude,
+            )
+
+            m_matrix = StochasticBioModel.reshape_to_matrix(
+                controller.stochastic_variables["m"].cx_start, controller.model.matrix_shape_m
+            )
+
+            constraint = df_dz_evaluated.T - dg_dz_evaluated.T @ m_matrix.T
+
+            out_vector = StochasticBioModel.reshape_to_vector(constraint)
+            return out_vector
+
+        @staticmethod
+        def stochastic_mean_sensory_input_equals_reference(
+            penalty: Constraint,
+            controller: PenaltyController,
+        ):
+            """
+            Get the error between the hand position and the reference.
+            """
+            ref = controller.stochastic_variables["ref"].cx_start
+            sensory_input = controller.model.sensory_reference(
+                states=controller.states.cx_start,
+                controls=controller.controls.cx_start,
+                parameters=controller.parameters.cx_start,
+                stochastic_variables=controller.stochastic_variables.cx_start,
+                nlp=controller.get_nlp,
+            )
+            return sensory_input - ref
+
     @staticmethod
     def get_dt(_):
         return 1
@@ -595,28 +907,39 @@ class ConstraintFcn(FcnEnum):
     """
 
     CONTINUITY = (PenaltyFunctionAbstract.Functions.continuity,)
-    TRACK_CONTROL = (PenaltyFunctionAbstract.Functions.minimize_controls,)
-    TRACK_STATE = (PenaltyFunctionAbstract.Functions.minimize_states,)
-    TRACK_QDDOT = (PenaltyFunctionAbstract.Functions.minimize_qddot,)
-    TRACK_MARKERS = (PenaltyFunctionAbstract.Functions.minimize_markers,)
-    TRACK_MARKERS_VELOCITY = (PenaltyFunctionAbstract.Functions.minimize_markers_velocity,)
-    SUPERIMPOSE_MARKERS = (PenaltyFunctionAbstract.Functions.superimpose_markers,)
-    SUPERIMPOSE_MARKERS_VELOCITY = (PenaltyFunctionAbstract.Functions.superimpose_markers_velocity,)
-    PROPORTIONAL_STATE = (PenaltyFunctionAbstract.Functions.proportional_states,)
-    PROPORTIONAL_CONTROL = (PenaltyFunctionAbstract.Functions.proportional_controls,)
-    TRACK_CONTACT_FORCES = (PenaltyFunctionAbstract.Functions.minimize_contact_forces,)
-    TRACK_SEGMENT_WITH_CUSTOM_RT = (PenaltyFunctionAbstract.Functions.track_segment_with_custom_rt,)
-    TRACK_MARKER_WITH_SEGMENT_AXIS = (PenaltyFunctionAbstract.Functions.track_marker_with_segment_axis,)
-    TRACK_COM_POSITION = (PenaltyFunctionAbstract.Functions.minimize_com_position,)
-    TRACK_COM_VELOCITY = (PenaltyFunctionAbstract.Functions.minimize_com_velocity,)
-    TRACK_ANGULAR_MOMENTUM = (PenaltyFunctionAbstract.Functions.minimize_angular_momentum,)
-    TRACK_LINEAR_MOMENTUM = (PenaltyFunctionAbstract.Functions.minimize_linear_momentum,)
-    TRACK_SEGMENT_ROTATION = (PenaltyFunctionAbstract.Functions.minimize_segment_rotation,)
-    TRACK_SEGMENT_VELOCITY = (PenaltyFunctionAbstract.Functions.minimize_segment_velocity,)
     CUSTOM = (PenaltyFunctionAbstract.Functions.custom,)
     NON_SLIPPING = (ConstraintFunction.Functions.non_slipping,)
-    TORQUE_MAX_FROM_Q_AND_QDOT = (ConstraintFunction.Functions.torque_max_from_q_and_qdot,)
+    PROPORTIONAL_CONTROL = (PenaltyFunctionAbstract.Functions.proportional_controls,)
+    PROPORTIONAL_STATE = (PenaltyFunctionAbstract.Functions.proportional_states,)
+    STOCHASTIC_COVARIANCE_MATRIX_CONTINUITY_IMPLICIT = (
+        ConstraintFunction.Functions.stochastic_covariance_matrix_continuity_implicit,
+    )
+    STOCHASTIC_DF_DX_IMPLICIT = (ConstraintFunction.Functions.stochastic_df_dx_implicit,)
+    STOCHASTIC_HELPER_MATRIX_COLLOCATION = (ConstraintFunction.Functions.stochastic_helper_matrix_collocation,)
+    STOCHASTIC_MEAN_SENSORY_INPUT_EQUALS_REFERENCE = (
+        ConstraintFunction.Functions.stochastic_mean_sensory_input_equals_reference,
+    )
+    SUPERIMPOSE_MARKERS = (PenaltyFunctionAbstract.Functions.superimpose_markers,)
+    SUPERIMPOSE_MARKERS_VELOCITY = (PenaltyFunctionAbstract.Functions.superimpose_markers_velocity,)
     TIME_CONSTRAINT = (ConstraintFunction.Functions.time_constraint,)
+    TORQUE_MAX_FROM_Q_AND_QDOT = (ConstraintFunction.Functions.torque_max_from_q_and_qdot,)
+    TRACK_ANGULAR_MOMENTUM = (PenaltyFunctionAbstract.Functions.minimize_angular_momentum,)
+    TRACK_COM_POSITION = (PenaltyFunctionAbstract.Functions.minimize_com_position,)
+    TRACK_COM_VELOCITY = (PenaltyFunctionAbstract.Functions.minimize_com_velocity,)
+    TRACK_CONTACT_FORCES = (PenaltyFunctionAbstract.Functions.minimize_contact_forces,)
+    TRACK_CONTROL = (PenaltyFunctionAbstract.Functions.minimize_controls,)
+    TRACK_LINEAR_MOMENTUM = (PenaltyFunctionAbstract.Functions.minimize_linear_momentum,)
+    TRACK_MARKER_WITH_SEGMENT_AXIS = (PenaltyFunctionAbstract.Functions.track_marker_with_segment_axis,)
+    TRACK_MARKERS = (PenaltyFunctionAbstract.Functions.minimize_markers,)
+    TRACK_MARKERS_ACCELERATION = (PenaltyFunctionAbstract.Functions.minimize_markers_acceleration,)
+    TRACK_MARKERS_VELOCITY = (PenaltyFunctionAbstract.Functions.minimize_markers_velocity,)
+    TRACK_PARAMETER = (PenaltyFunctionAbstract.Functions.minimize_parameter,)
+    TRACK_POWER = (PenaltyFunctionAbstract.Functions.minimize_power,)
+    TRACK_QDDOT = (PenaltyFunctionAbstract.Functions.minimize_qddot,)
+    TRACK_SEGMENT_ROTATION = (PenaltyFunctionAbstract.Functions.minimize_segment_rotation,)
+    TRACK_SEGMENT_VELOCITY = (PenaltyFunctionAbstract.Functions.minimize_segment_velocity,)
+    TRACK_SEGMENT_WITH_CUSTOM_RT = (PenaltyFunctionAbstract.Functions.track_segment_with_custom_rt,)
+    TRACK_STATE = (PenaltyFunctionAbstract.Functions.minimize_states,)
     TRACK_VECTOR_ORIENTATIONS_FROM_MARKERS = (PenaltyFunctionAbstract.Functions.track_vector_orientations_from_markers,)
 
     @staticmethod
@@ -651,3 +974,170 @@ class ImplicitConstraintFcn(FcnEnum):
         """
 
         return ConstraintFunction
+
+
+class ParameterConstraint(PenaltyOption):
+    """
+    A placeholder for a parameter constraint
+
+    Attributes
+    ----------
+    min_bound: np.ndarray
+        The vector of minimum bound of the constraint. Default is 0
+    max_bound: np.ndarray
+        The vector of maximal bound of the constraint. Default is 0
+    """
+
+    def __init__(
+        self,
+        parameter_constraint: Any,
+        min_bound: np.ndarray | float = None,
+        max_bound: np.ndarray | float = None,
+        quadratic: bool = False,
+        **params: Any,
+    ):
+        """
+        Parameters
+        ----------
+        parameter_constraint: ConstraintFcn
+            The chosen parameter constraint
+        min_bound: np.ndarray
+            The vector of minimum bound of the constraint. Default is 0
+        max_bound: np.ndarray
+            The vector of maximal bound of the constraint. Default is 0
+        quadratic: bool
+            If the penalty is quadratic
+        params:
+            Generic parameters for options
+        """
+        custom_function = None
+        if not isinstance(parameter_constraint, (ConstraintFcn, ImplicitConstraintFcn)):
+            custom_function = parameter_constraint
+            parameter_constraint = ConstraintFcn.CUSTOM
+
+        super(ParameterConstraint, self).__init__(
+            penalty=parameter_constraint, quadratic=quadratic, custom_function=custom_function, **params
+        )
+
+        if isinstance(parameter_constraint, ImplicitConstraintFcn):
+            self.penalty_type = ConstraintType.IMPLICIT  # doing this puts the relevance of this enum in question
+
+        self.min_bound = min_bound
+        self.max_bound = max_bound
+        # TODO Benjamin Check .name
+        self.bounds = Bounds(parameter_constraint.name, interpolation=InterpolationType.CONSTANT)
+
+    def set_penalty(self, penalty: MX | SX, controller: PenaltyController):
+        super(ParameterConstraint, self).set_penalty(penalty, controller)
+        self.min_bound = 0 if self.min_bound is None else self.min_bound
+        self.max_bound = 0 if self.max_bound is None else self.max_bound
+
+    def add_or_replace_to_penalty_pool(self, ocp, nlp):
+        if self.type == ConstraintFcn.TIME_CONSTRAINT:
+            self.node = Node.END
+
+        super(ParameterConstraint, self).add_or_replace_to_penalty_pool(ocp, nlp)
+
+        self.min_bound = np.array(self.min_bound) if isinstance(self.min_bound, (list, tuple)) else self.min_bound
+        self.max_bound = np.array(self.max_bound) if isinstance(self.max_bound, (list, tuple)) else self.max_bound
+
+        if self.bounds.shape[0] == 0:
+            for i in self.rows:
+                min_bound = (
+                    self.min_bound[i]
+                    if hasattr(self.min_bound, "__getitem__") and self.min_bound.shape[0] > 1
+                    else self.min_bound
+                )
+                max_bound = (
+                    self.max_bound[i]
+                    if hasattr(self.max_bound, "__getitem__") and self.max_bound.shape[0] > 1
+                    else self.max_bound
+                )
+                self.bounds.concatenate(Bounds(min_bound, max_bound, interpolation=InterpolationType.CONSTANT))
+        elif self.bounds.shape[0] != len(self.rows):
+            raise RuntimeError(f"bounds rows is {self.bounds.shape[0]} but should be {self.rows} or empty")
+
+    def _add_penalty_to_pool(self, controller: PenaltyController):
+        if isinstance(controller, (list, tuple)):
+            controller = controller[0]  # This is a special case of Node.TRANSITION
+
+        if self.penalty_type == PenaltyType.INTERNAL:
+            pool = (
+                controller.get_nlp.g_internal
+                if controller is not None and controller.get_nlp
+                else controller.ocp.g_internal
+            )
+        elif self.penalty_type == ConstraintType.IMPLICIT:
+            pool = (
+                controller.get_nlp.g_implicit
+                if controller is not None and controller.get_nlp
+                else controller.ocp.g_implicit
+            )
+        elif self.penalty_type == PenaltyType.USER:
+            pool = controller.get_nlp.g if controller is not None and controller.get_nlp else controller.ocp.g
+        else:
+            raise ValueError(f"Invalid constraint type {self.penalty_type}.")
+        pool[self.list_index] = self
+
+    def ensure_penalty_sanity(self, ocp, nlp):
+        if self.penalty_type == PenaltyType.INTERNAL:
+            g_to_add_to = nlp.g_internal if nlp else ocp.g_internal
+        elif self.penalty_type == ConstraintType.IMPLICIT:
+            g_to_add_to = nlp.g_implicit if nlp else ocp.g_implicit
+        elif self.penalty_type == PenaltyType.USER:
+            g_to_add_to = nlp.g if nlp else ocp.g
+        else:
+            raise ValueError(f"Invalid Type of Constraint {self.penalty_type}")
+
+        if self.list_index < 0:
+            for i, j in enumerate(g_to_add_to):
+                if not j:
+                    self.list_index = i
+                    return
+            else:
+                g_to_add_to.append([])
+                self.list_index = len(g_to_add_to) - 1
+        else:
+            while self.list_index >= len(g_to_add_to):
+                g_to_add_to.append([])
+            g_to_add_to[self.list_index] = []
+
+
+class ParameterConstraintList(OptionList):
+    """
+    A list of ParameterConstraint if more than one is required
+
+    Methods
+    -------
+    add(self, parameter_constraint: Callable | "ConstraintFcn", **extra_arguments)
+        Add a new Constraint to the list
+    print(self)
+        Print the ParameterConstraintList to the console
+    """
+
+    def add(self, parameter_constraint: Callable | ParameterConstraint | Any, **extra_arguments: Any):
+        """
+        Add a new constraint to the list
+
+        Parameters
+        ----------
+        parameter_constraint: Callable | Constraint | ConstraintFcn
+            The chosen parameter constraint
+        extra_arguments: dict
+            Any parameters to pass to Constraint
+        """
+
+        if isinstance(parameter_constraint, Constraint):
+            self.copy(parameter_constraint)
+
+        else:
+            super(ParameterConstraintList, self)._add(
+                option_type=ParameterConstraint, parameter_constraint=parameter_constraint, **extra_arguments
+            )
+
+    def print(self):
+        """
+        Print the ParameterConstraintList to the console
+        """
+        # TODO: Print all elements in the console
+        raise NotImplementedError("Printing of ParameterConstraintList is not ready yet")

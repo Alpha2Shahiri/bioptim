@@ -17,8 +17,9 @@ from bioptim import (
     OptimalControlProgram,
     DynamicsFcn,
     Dynamics,
-    InitialGuess,
+    InitialGuessList,
     Objective,
+    BoundsList,
     FatigueBounds,
     FatigueInitialGuess,
     FatigueList,
@@ -43,6 +44,7 @@ def prepare_ocp(
     split_controls: bool,
     use_sx: bool = True,
     assume_phase_dynamics: bool = True,
+    expand_dynamics: bool = True,
 ) -> OptimalControlProgram:
     """
     The initialization of an ocp
@@ -65,6 +67,10 @@ def prepare_ocp(
         If the dynamics equation within a phase is unique or changes at each node. True is much faster, but lacks the
         capability to have changing dynamics within a phase. A good example of when False should be used is when
         different external forces are applied at each node
+    expand_dynamics: bool
+        If the dynamics function should be expanded. Please note, this will solve the problem faster, but will slow down
+        the declaration of the OCP, so it is a trade-off. Also depending on the solver, it may or may not work
+        (for instance IRK is not compatible with expanded dynamics)
 
     Returns
     -------
@@ -76,7 +82,7 @@ def prepare_ocp(
     tau_min, tau_max, tau_init = -100, 100, 0
 
     # Add objective functions
-    objective_functions = Objective(ObjectiveFcn.Lagrange.MINIMIZE_CONTROL, key="tau", expand=True)
+    objective_functions = Objective(ObjectiveFcn.Lagrange.MINIMIZE_CONTROL, key="tau", expand=expand_dynamics)
 
     # Fatigue parameters
     fatigue_dynamics = FatigueList()
@@ -141,27 +147,32 @@ def prepare_ocp(
     dynamics = Dynamics(DynamicsFcn.TORQUE_DRIVEN, fatigue=fatigue_dynamics, expand=True)
 
     # Path constraint
-    x_bounds = bio_model.bounds_from_ranges(["q", "qdot"])
-    x_bounds[:, [0, -1]] = 0
-    x_bounds[1, -1] = 3.14
+    x_bounds = BoundsList()
+    x_bounds["q"] = bio_model.bounds_from_ranges("q")
+    x_bounds["q"][:, [0, -1]] = 0
+    x_bounds["q"][1, -1] = 3.14
+    x_bounds["qdot"] = bio_model.bounds_from_ranges("qdot")
+    x_bounds["qdot"][:, [0, -1]] = 0
+
     x_bounds.concatenate(FatigueBounds(fatigue_dynamics, fix_first_frame=True))
     if fatigue_type != "effort":
-        x_bounds[[5, 11], 0] = 0  # The rotation dof is passive (fatigue_ma = 0)
+        x_bounds["tau_minus_ma"][1, 0] = 0  # The rotation dof is passive (fatigue_ma = 0)
+        x_bounds["tau_plus_ma"][1, 0] = 0  # The rotation dof is passive (fatigue_ma = 0)
         if fatigue_type == "xia":
-            x_bounds[[7, 13], 0] = 1  # The rotation dof is passive (fatigue_mr = 1)
+            x_bounds["tau_minus_mr"][1, 0] = 1  # The rotation dof is passive (fatigue_mr = 1)
+            x_bounds["tau_plus_mr"][1, 0] = 1  # The rotation dof is passive (fatigue_mr = 1)
 
     # Initial guess
-    n_q = bio_model.nb_q
-    n_qdot = bio_model.nb_qdot
-    x_init = InitialGuess([0] * (n_q + n_qdot))
+    x_init = InitialGuessList()
     x_init.concatenate(FatigueInitialGuess(fatigue_dynamics))
 
     # Define control path constraint
     u_bounds = FatigueBounds(fatigue_dynamics, variable_type=VariableType.CONTROLS)
     if split_controls:
-        u_bounds[[1, 3], :] = 0  # The rotation dof is passive
+        u_bounds["tau_minus"][1, :] = 0  # The rotation dof is passive
+        u_bounds["tau_plus"][1, :] = 0  # The rotation dof is passive
     else:
-        u_bounds[1, :] = 0  # The rotation dof is passive
+        u_bounds["tau"][1, :] = 0  # The rotation dof is passive
     u_init = FatigueInitialGuess(fatigue_dynamics, variable_type=VariableType.CONTROLS)
 
     return OptimalControlProgram(

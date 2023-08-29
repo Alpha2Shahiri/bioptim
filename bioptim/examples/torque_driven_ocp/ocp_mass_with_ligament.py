@@ -23,6 +23,8 @@ def prepare_ocp(
     ode_solver=OdeSolver.RK4(),
     rigidbody_dynamics: RigidBodyDynamics = RigidBodyDynamics.ODE,
     assume_phase_dynamics: bool = True,
+    n_threads: int = 8,
+    expand_dynamics: bool = True,
 ) -> OptimalControlProgram:
     """
     Prepare the ocp
@@ -41,6 +43,12 @@ def prepare_ocp(
         If the dynamics equation within a phase is unique or changes at each node. True is much faster, but lacks the
         capability to have changing dynamics within a phase. A good example of when False should be used is when
         different external forces are applied at each node
+    n_threads: int
+        Number of threads to use
+    expand_dynamics: bool
+        If the dynamics function should be expanded. Please note, this will solve the problem faster, but will slow down
+        the declaration of the OCP, so it is a trade-off. Also depending on the solver, it may or may not work
+        (for instance IRK is not compatible with expanded dynamics)
 
     Returns
     -------
@@ -61,49 +69,44 @@ def prepare_ocp(
 
     # Dynamics
     dynamics = DynamicsList()
-    dynamics.add(DynamicsFcn.TORQUE_DRIVEN, rigidbody_dynamics=rigidbody_dynamics, with_ligament=True)
+    dynamics.add(
+        DynamicsFcn.TORQUE_DRIVEN,
+        rigidbody_dynamics=rigidbody_dynamics,
+        with_ligament=True,
+        expand=expand_dynamics,
+    )
 
     # Path constraint
-    x_bounds = bio_model.bounds_from_ranges(["q", "qdot"])
-    x_bounds[0, 0] = 0
-    x_bounds[1, 0] = 0
+    x_bounds = BoundsList()
+    x_bounds["q"] = bio_model.bounds_from_ranges("q")
+    x_bounds["q"][0, 0] = 0
+    x_bounds["qdot"] = bio_model.bounds_from_ranges("qdot")
+    x_bounds["qdot"][0, 0] = 0
+
     # Define control path constraint
     u_bounds = BoundsList()
     u_init = InitialGuessList()
 
-    if rigidbody_dynamics == RigidBodyDynamics.ODE:
-        u_bounds.add(
-            [tau_min] * bio_model.nb_tau,
-            [tau_max] * bio_model.nb_tau,
-        )
-        u_init.add([tau_init] * bio_model.nb_tau)
-    elif (
+    u_bounds["tau"] = [tau_min] * bio_model.nb_tau, [tau_max] * bio_model.nb_tau
+    u_init["tau"] = [tau_init] * bio_model.nb_tau
+    if (
         rigidbody_dynamics == RigidBodyDynamics.DAE_INVERSE_DYNAMICS
         or rigidbody_dynamics == RigidBodyDynamics.DAE_FORWARD_DYNAMICS
     ):
-        u_bounds.add(
-            [tau_min] * bio_model.nb_tau + [qddot_min] * bio_model.nb_qddot,
-            [tau_max] * bio_model.nb_tau + [qddot_max] * bio_model.nb_qddot,
-        )
-        u_init.add([tau_init] * bio_model.nb_tau + [qddot_init] * bio_model.nb_qddot)
-    else:
-        raise NotImplementedError("other dynamics are not implemented yet")
-    # Initial guess
-    x_init = InitialGuessList()
-    x_init.add([0] * bio_model.nb_q + [0] * bio_model.nb_qdot)
+        u_bounds["qddot"] = [qddot_min] * bio_model.nb_qddot, [qddot_max] * bio_model.nb_qddot
+        u_init["qddot"] = [qddot_init] * bio_model.nb_qddot
 
     return OptimalControlProgram(
         bio_model,
         dynamics,
         number_shooting_points,
         final_time,
-        x_init,
-        u_init,
-        x_bounds,
-        u_bounds,
-        objective_functions,
+        x_bounds=x_bounds,
+        u_bounds=u_bounds,
+        u_init=u_init,
+        objective_functions=objective_functions,
         ode_solver=ode_solver,
-        n_threads=8,
+        n_threads=n_threads,
         use_sx=use_sx,
         assume_phase_dynamics=assume_phase_dynamics,
     )

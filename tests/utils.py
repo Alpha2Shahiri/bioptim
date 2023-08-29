@@ -6,15 +6,15 @@ import pickle
 
 import numpy as np
 import pytest
-from casadi import MX
+from casadi import MX, Function
 from bioptim import (
     BiorbdModel,
     OptimalControlProgram,
     BiMapping,
     Mapping,
     OdeSolver,
-    Bounds,
-    InitialGuess,
+    BoundsList,
+    InitialGuessList,
     Shooting,
     Solver,
     SolutionIntegrator,
@@ -38,7 +38,7 @@ class TestUtils:
         return module
 
     @staticmethod
-    def save_and_load(sol, ocp, test_solve_of_loaded=False):
+    def save_and_load(sol, ocp, test_solve_of_loaded=False, solver=None):
         file_path = "test"
         ocp.save(sol, f"{file_path}.bo")
         ocp_load, sol_load = OptimalControlProgram.load(f"{file_path}.bo")
@@ -46,7 +46,7 @@ class TestUtils:
         TestUtils.deep_assert(sol, sol_load)
         TestUtils.deep_assert(sol_load, sol)
         if test_solve_of_loaded:
-            sol_from_load = ocp_load.solve()
+            sol_from_load = ocp_load.solve(solver)
             TestUtils.deep_assert(sol, sol_from_load)
             TestUtils.deep_assert(sol_from_load, sol)
 
@@ -71,8 +71,13 @@ class TestUtils:
         elif isinstance(first_elem, (list, tuple)):
             for i in range(len(first_elem)):
                 TestUtils.deep_assert(first_elem[i], second_elem[i])
-        elif isinstance(first_elem, (OptimalControlProgram, Bounds, InitialGuess, BiMapping, Mapping, OdeSolver)):
+        elif isinstance(
+            first_elem, (OptimalControlProgram, BoundsList, InitialGuessList, BiMapping, Mapping, OdeSolver)
+        ):
             for key in dir(first_elem):
+                if type(first_elem) in (Mapping, BiMapping) and key in ("param_when_copying", "shape", "value"):
+                    # These are designed to fail, so don't test them
+                    continue
                 TestUtils.deep_assert(getattr(first_elem, key), getattr(second_elem, key))
         else:
             if not callable(first_elem) and not isinstance(first_elem, (MX, BiorbdModel)):
@@ -94,16 +99,21 @@ class TestUtils:
         sol_warm_start = ocp.solve(solver)
         if ocp.n_phases > 1:
             for i in range(ocp.n_phases):
-                np.testing.assert_almost_equal(
-                    sol_warm_start.states[i]["all"], sol.states[i]["all"], decimal=state_decimal
-                )
-                np.testing.assert_almost_equal(
-                    sol_warm_start.controls[i]["all"], sol.controls[i]["all"], decimal=control_decimal
-                )
+                for key in sol.states[i]:
+                    np.testing.assert_almost_equal(
+                        sol_warm_start.states[i][key], sol.states[i][key], decimal=state_decimal
+                    )
+                for key in sol.controls[i]:
+                    np.testing.assert_almost_equal(
+                        sol_warm_start.controls[i][key], sol.controls[i][key], decimal=control_decimal
+                    )
         else:
-            np.testing.assert_almost_equal(sol_warm_start.states["all"], sol.states["all"], decimal=state_decimal)
-            np.testing.assert_almost_equal(sol_warm_start.controls["all"], sol.controls["all"], decimal=control_decimal)
-        np.testing.assert_almost_equal(sol_warm_start.parameters["all"], sol.parameters["all"], decimal=param_decimal)
+            for key in sol.states:
+                np.testing.assert_almost_equal(sol_warm_start.states[key], sol.states[key], decimal=state_decimal)
+            for key in sol.controls:
+                np.testing.assert_almost_equal(sol_warm_start.controls[key], sol.controls[key], decimal=control_decimal)
+        for key in sol_warm_start.parameters.keys():
+            np.testing.assert_almost_equal(sol_warm_start.parameters[key], sol.parameters[key], decimal=param_decimal)
 
     @staticmethod
     def simulate(sol, decimal_value=7):
@@ -124,6 +134,22 @@ class TestUtils:
                 )
             return
 
+        if sum([isinstance(nlp.ode_solver, OdeSolver.TRAPEZOIDAL) for nlp in sol.ocp.nlp]):
+            with pytest.raises(
+                ValueError,
+                match="When the ode_solver of the Optimal Control Problem is OdeSolver.TRAPEZOIDAL, "
+                "we cannot use the SolutionIntegrator.OCP.\n"
+                "We must use one of the SolutionIntegrator provided by scipy with any Shooting Enum such as"
+                " Shooting.SINGLE, Shooting.MULTIPLE, or Shooting.SINGLE_DISCONTINUOUS_PHASE",
+            ):
+                sol.integrate(
+                    merge_phases=True,
+                    shooting_type=Shooting.SINGLE,
+                    keep_intermediate_points=True,
+                    integrator=SolutionIntegrator.OCP,
+                )
+            return
+
         sol_single = sol.integrate(
             merge_phases=True,
             shooting_type=Shooting.SINGLE,
@@ -132,8 +158,58 @@ class TestUtils:
         )
 
         # Evaluate the final error of the single shooting integration versus the finale node
-        np.testing.assert_almost_equal(
-            sol_merged.states["all"][:, -1],
-            sol_single.states["all"][:, -1],
-            decimal=decimal_value,
+        for key in sol_merged.states.keys():
+            np.testing.assert_almost_equal(
+                sol_merged.states[key][:, -1],
+                sol_single.states[key][:, -1],
+                decimal=decimal_value,
+            )
+
+    @staticmethod
+    def mx_to_array(mx: MX, squeeze: bool = True, expand: bool = True) -> np.ndarray:
+        """
+        Convert a casadi MX to a numpy array if it is only numeric values
+        """
+        val = Function(
+            "f",
+            [],
+            [mx],
+            [],
+            ["f"],
         )
+        if expand:
+            val = val.expand()
+        val = val()["f"].toarray()
+
+        return val.squeeze() if squeeze else val
+
+    @staticmethod
+    def to_array(value: MX | np.ndarray):
+        if isinstance(value, MX):
+            return TestUtils.mx_to_array(value)
+        else:
+            return value
+
+    @staticmethod
+    def mx_assert_equal(mx: MX, expected: Any, decimal: int = 6, squeeze: bool = True, expand: bool = True):
+        """
+        Assert that a casadi MX is equal to a numpy array if it is only numeric values
+        """
+        if isinstance(expected, MX):
+            expected = TestUtils.mx_to_array(mx, squeeze=squeeze, expand=expand)
+
+        np.testing.assert_almost_equal(
+            TestUtils.mx_to_array(mx, squeeze=squeeze, expand=expand), expected, decimal=decimal
+        )
+
+    @staticmethod
+    def assert_equal(
+        value: MX | np.ndarray, expected: Any, decimal: int = 6, squeeze: bool = True, expand: bool = True
+    ):
+        """
+        Assert that a casadi MX or numpy array is equal to a numpy array if it is only numeric values
+        """
+        if isinstance(value, MX):
+            TestUtils.mx_assert_equal(value, expected, decimal=decimal, squeeze=squeeze, expand=expand)
+        else:
+            np.testing.assert_almost_equal(value, expected, decimal=decimal)

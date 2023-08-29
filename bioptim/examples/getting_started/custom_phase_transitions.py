@@ -68,6 +68,7 @@ def prepare_ocp(
     biorbd_model_path: str = "models/cube.bioMod",
     ode_solver: OdeSolverBase = OdeSolver.RK4(),
     assume_phase_dynamics: bool = True,
+    expand_dynamics: bool = True,
 ) -> OptimalControlProgram:
     """
     Parameters
@@ -80,6 +81,10 @@ def prepare_ocp(
         If the dynamics equation within a phase is unique or changes at each node. True is much faster, but lacks the
         capability to have changing dynamics within a phase. A good example of when False should be used is when
         different external forces are applied at each node
+    expand_dynamics: bool
+        If the dynamics function should be expanded. Please note, this will solve the problem faster, but will slow down
+        the declaration of the OCP, so it is a trade-off. Also depending on the solver, it may or may not work
+        (for instance IRK is not compatible with expanded dynamics)
 
     Returns
     -------
@@ -108,11 +113,10 @@ def prepare_ocp(
 
     # Dynamics
     dynamics = DynamicsList()
-    expand = False if isinstance(ode_solver, OdeSolver.IRK) else True
-    dynamics.add(DynamicsFcn.TORQUE_DRIVEN, expand=expand)
-    dynamics.add(DynamicsFcn.TORQUE_DRIVEN, expand=expand)
-    dynamics.add(DynamicsFcn.TORQUE_DRIVEN, expand=expand)
-    dynamics.add(DynamicsFcn.TORQUE_DRIVEN, expand=expand)
+    dynamics.add(DynamicsFcn.TORQUE_DRIVEN, expand=expand_dynamics)
+    dynamics.add(DynamicsFcn.TORQUE_DRIVEN, expand=expand_dynamics)
+    dynamics.add(DynamicsFcn.TORQUE_DRIVEN, expand=expand_dynamics)
+    dynamics.add(DynamicsFcn.TORQUE_DRIVEN, expand=expand_dynamics)
 
     # Constraints
     constraints = ConstraintList()
@@ -124,36 +128,47 @@ def prepare_ocp(
 
     # Path constraint
     x_bounds = BoundsList()
-    x_bounds.add(bounds=bio_model[0].bounds_from_ranges(["q", "qdot"]))
-    x_bounds.add(bounds=bio_model[0].bounds_from_ranges(["q", "qdot"]))
-    x_bounds.add(bounds=bio_model[0].bounds_from_ranges(["q", "qdot"]))
-    x_bounds.add(bounds=bio_model[0].bounds_from_ranges(["q", "qdot"]))
+    x_bounds.add("q", bounds=bio_model[0].bounds_from_ranges("q"), phase=0)
+    x_bounds.add("qdot", bounds=bio_model[0].bounds_from_ranges("qdot"), phase=0)
+    x_bounds.add("q", bounds=bio_model[1].bounds_from_ranges("q"), phase=1)
+    x_bounds.add("qdot", bounds=bio_model[1].bounds_from_ranges("qdot"), phase=1)
+    x_bounds.add("q", bounds=bio_model[2].bounds_from_ranges("q"), phase=2)
+    x_bounds.add("qdot", bounds=bio_model[2].bounds_from_ranges("qdot"), phase=2)
+    x_bounds.add("q", bounds=bio_model[3].bounds_from_ranges("q"), phase=3)
+    x_bounds.add("qdot", bounds=bio_model[3].bounds_from_ranges("qdot"), phase=3)
 
-    x_bounds[0][[1, 3, 4, 5], 0] = 0
-    x_bounds[-1][[1, 3, 4, 5], -1] = 0
+    x_bounds[0]["q"][1, 0] = 0
+    x_bounds[0]["qdot"][:, 0] = 0
+    x_bounds[-1]["q"][1, -1] = 0
+    x_bounds[-1]["qdot"][:, -1] = 0
 
-    x_bounds[0][2, 0] = 0.0
-    x_bounds[2][2, [0, -1]] = [0.0, 1.57]
+    x_bounds[0]["q"][2, 0] = 0.0
+    x_bounds[2]["q"][2, [0, -1]] = [0.0, 1.57]
 
-    # Initial guess
+    # Initial guess (Still optional)
     x_init = InitialGuessList()
-    x_init.add([0] * (bio_model[0].nb_q + bio_model[0].nb_qdot))
-    x_init.add([0] * (bio_model[0].nb_q + bio_model[0].nb_qdot))
-    x_init.add([0] * (bio_model[0].nb_q + bio_model[0].nb_qdot))
-    x_init.add([0] * (bio_model[0].nb_q + bio_model[0].nb_qdot))
+    x_init.add("q", [0] * bio_model[0].nb_q, phase=0)
+    x_init.add("qdot", [0] * bio_model[0].nb_qdot, phase=0)
+    x_init.add("q", [0] * bio_model[0].nb_q, phase=1)
+    x_init.add("qdot", [0] * bio_model[0].nb_qdot, phase=1)
+    x_init.add("q", [0] * bio_model[0].nb_q, phase=2)
+    x_init.add("qdot", [0] * bio_model[0].nb_qdot, phase=2)
+    x_init.add("q", [0] * bio_model[0].nb_q, phase=3)
+    x_init.add("qdot", [0] * bio_model[0].nb_qdot, phase=3)
 
     # Define control path constraint
     u_bounds = BoundsList()
-    u_bounds.add([tau_min] * bio_model[0].nb_tau, [tau_max] * bio_model[0].nb_tau)
-    u_bounds.add([tau_min] * bio_model[0].nb_tau, [tau_max] * bio_model[0].nb_tau)
-    u_bounds.add([tau_min] * bio_model[0].nb_tau, [tau_max] * bio_model[0].nb_tau)
-    u_bounds.add([tau_min] * bio_model[0].nb_tau, [tau_max] * bio_model[0].nb_tau)
+    u_bounds.add("tau", min_bound=[tau_min] * bio_model[0].nb_tau, max_bound=[tau_max] * bio_model[0].nb_tau, phase=0)
+    u_bounds.add("tau", min_bound=[tau_min] * bio_model[0].nb_tau, max_bound=[tau_max] * bio_model[0].nb_tau, phase=1)
+    u_bounds.add("tau", min_bound=[tau_min] * bio_model[0].nb_tau, max_bound=[tau_max] * bio_model[0].nb_tau, phase=2)
+    u_bounds.add("tau", min_bound=[tau_min] * bio_model[0].nb_tau, max_bound=[tau_max] * bio_model[0].nb_tau, phase=3)
 
+    # Initial guess (Still optional)
     u_init = InitialGuessList()
-    u_init.add([tau_init] * bio_model[0].nb_tau)
-    u_init.add([tau_init] * bio_model[0].nb_tau)
-    u_init.add([tau_init] * bio_model[0].nb_tau)
-    u_init.add([tau_init] * bio_model[0].nb_tau)
+    u_init.add("tau", [tau_init] * bio_model[0].nb_tau, phase=0)
+    u_init.add("tau", [tau_init] * bio_model[0].nb_tau, phase=1)
+    u_init.add("tau", [tau_init] * bio_model[0].nb_tau, phase=2)
+    u_init.add("tau", [tau_init] * bio_model[0].nb_tau, phase=3)
 
     """
     By default, all phase transitions (here phase 0 to phase 1, phase 1 to phase 2 and phase 2 to phase 3)
@@ -179,12 +194,11 @@ def prepare_ocp(
         dynamics,
         n_shooting,
         final_time,
-        x_init,
-        u_init,
-        x_bounds,
-        u_bounds,
-        objective_functions,
-        constraints,
+        x_bounds=x_bounds,
+        u_bounds=u_bounds,
+        x_init=x_init,
+        objective_functions=objective_functions,
+        constraints=constraints,
         ode_solver=ode_solver,
         phase_transitions=phase_transitions,
         assume_phase_dynamics=assume_phase_dynamics,

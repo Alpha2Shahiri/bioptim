@@ -17,6 +17,7 @@ def custom_dynamics(
     states: MX,
     controls: MX,
     parameters: MX,
+    stochastic_variables: MX,
     nlp: NonLinearProgram,
 ) -> DynamicsEvaluation:
     """
@@ -56,4 +57,4 @@ def custom_configure_my_dynamics(ocp: OptimalControlProgram, nlp: NonLinearProgr
     ConfigureProblem.configure_qdot(ocp, nlp, as_states=True, as_controls=False)
     ConfigureProblem.configure_tau(ocp, nlp, as_states=False, as_controls=True)
 
-    ConfigureProblem.configure_dynamics_function(ocp, nlp, custom_dynamics, expand=True)
+    ConfigureProblem.configure_dynamics_function(ocp, nlp, custom_dynamics)

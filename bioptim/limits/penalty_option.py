@@ -1,13 +1,13 @@
 from typing import Any, Callable
 
 import biorbd_casadi as biorbd
-from casadi import horzcat, vertcat, Function, MX, SX
+from casadi import horzcat, vertcat, Function, MX, SX, jacobian, diag
 import numpy as np
 
 from .penalty_controller import PenaltyController
-from ..misc.enums import Node, PlotType, ControlType, PenaltyType, IntegralApproximation
-from ..misc.mapping import Mapping
+from ..misc.enums import Node, PlotType, ControlType, PenaltyType, QuadratureRule
 from ..misc.options import OptionGeneric
+from ..interfaces.stochastic_bio_model import StochasticBioModel
 
 
 class PenaltyOption(OptionGeneric):
@@ -48,7 +48,7 @@ class PenaltyOption(OptionGeneric):
         If the minimization is applied on the numerical derivative of the state [f(t+1) - f(t)]
     explicit_derivative: bool
         If the minimization is applied to derivative of the penalty [f(t, t+1)]
-    integration_rule: IntegralApproximation
+    integration_rule: QuadratureRule
         The integration rule to use for the penalty
     transition: bool
         If the penalty is a transition
@@ -95,12 +95,13 @@ class PenaltyOption(OptionGeneric):
         derivative: bool = False,
         explicit_derivative: bool = False,
         integrate: bool = False,
-        integration_rule: IntegralApproximation = IntegralApproximation.DEFAULT,
+        integration_rule: QuadratureRule = QuadratureRule.DEFAULT,
         index: list = None,
         rows: list | tuple | range | np.ndarray = None,
         cols: list | tuple | range | np.ndarray = None,
         custom_function: Callable = None,
         penalty_type: PenaltyType = PenaltyType.USER,
+        is_stochastic: bool = False,
         multi_thread: bool = None,
         expand: bool = False,
         **params: Any,
@@ -126,7 +127,7 @@ class PenaltyOption(OptionGeneric):
             If the function should be evaluated at [X, X+1]
         integrate: bool
             If the function should be integrated
-        integration_rule: IntegralApproximation
+        integration_rule: QuadratureRule
             The rule to use for the integration
         index: int
             The component index the penalty is acting on
@@ -134,6 +135,8 @@ class PenaltyOption(OptionGeneric):
             A user defined function to call to get the penalty
         penalty_type: PenaltyType
             If the penalty is from the user or from bioptim (implicit or internal)
+        is_stochastic: bool
+            If the penalty is stochastic (i.e. if we should look instead at the variation of the penalty)
         **params: dict
             Generic parameters for the penalty
         """
@@ -141,6 +144,15 @@ class PenaltyOption(OptionGeneric):
         super(PenaltyOption, self).__init__(phase=phase, type=penalty, **params)
         self.node: Node | list | tuple = node
         self.quadratic = quadratic
+        if integration_rule not in (
+            QuadratureRule.DEFAULT,
+            QuadratureRule.RECTANGLE_LEFT,
+            QuadratureRule.TRAPEZOIDAL,
+            QuadratureRule.APPROXIMATE_TRAPEZOIDAL,
+        ):
+            raise NotImplementedError(
+                f"{params['integration_rule']} has not been implemented yet for objective functions."
+            )
         self.integration_rule = integration_rule
 
         if index is not None and rows is not None:
@@ -164,8 +176,8 @@ class PenaltyOption(OptionGeneric):
                 if len(self.target[-1].shape) == 1:
                     self.target[-1] = self.target[-1][:, np.newaxis]
             if len(self.target) == 1 and (
-                self.integration_rule == IntegralApproximation.TRAPEZOIDAL
-                or self.integration_rule == IntegralApproximation.TRUE_TRAPEZOIDAL
+                self.integration_rule == QuadratureRule.APPROXIMATE_TRAPEZOIDAL
+                or self.integration_rule == QuadratureRule.TRAPEZOIDAL
             ):
                 if self.node == Node.ALL or self.node == Node.DEFAULT:
                     self.target = [self.target[0][:, :-1], self.target[0][:, 1:]]
@@ -182,8 +194,8 @@ class PenaltyOption(OptionGeneric):
         self.plot_target = (
             False
             if (
-                self.integration_rule == IntegralApproximation.TRAPEZOIDAL
-                or self.integration_rule == IntegralApproximation.TRUE_TRAPEZOIDAL
+                self.integration_rule == QuadratureRule.APPROXIMATE_TRAPEZOIDAL
+                or self.integration_rule == QuadratureRule.TRAPEZOIDAL
             )
             else True
         )
@@ -208,6 +220,7 @@ class PenaltyOption(OptionGeneric):
         if self.derivative and self.explicit_derivative:
             raise ValueError("derivative and explicit_derivative cannot be both True")
         self.penalty_type = penalty_type
+        self.is_stochastic = is_stochastic
 
         self.multi_thread = multi_thread
 
@@ -276,7 +289,7 @@ class PenaltyOption(OptionGeneric):
             The expected number of columns (n_rows, n_cols) of the data to track
         """
 
-        if self.integration_rule == IntegralApproximation.RECTANGLE:
+        if self.integration_rule == QuadratureRule.RECTANGLE_LEFT:
             n_dim = len(self.target[0].shape)
             if n_dim != 2 and n_dim != 3:
                 raise RuntimeError(
@@ -313,8 +326,8 @@ class PenaltyOption(OptionGeneric):
                         (self.target[0], np.nan * np.zeros((self.target[0].shape[0], 1))), axis=1
                     )
         elif (
-            self.integration_rule == IntegralApproximation.TRAPEZOIDAL
-            or self.integration_rule == IntegralApproximation.TRAPEZOIDAL
+            self.integration_rule == QuadratureRule.APPROXIMATE_TRAPEZOIDAL
+            or self.integration_rule == QuadratureRule.APPROXIMATE_TRAPEZOIDAL
         ):
             target_dim = len(self.target)
             if target_dim != 2:
@@ -358,6 +371,41 @@ class PenaltyOption(OptionGeneric):
                         raise NotImplementedError("Modifying target for END not being last is not implemented yet")
                     self.target = np.concatenate((self.target, np.nan * np.zeros((self.target.shape[0], 1))), axis=1)
 
+    def transform_penalty_to_stochastic(self, controller: PenaltyController, fcn, state_cx_scaled):
+        """
+        Transform the penalty fcn into the variation of fcn depending on the noise:
+            fcn = fcn(x, u, p, s) becomes d/dx(fcn) * covariance * d/dx(fcn).T
+
+        Please note that this is usually used to add a buffer around an equality constraint h(x, u, p, s) = 0
+        transforming it into an inequality constraint of the form:
+            h(x, u, p, s) + sqrt(dh/dx * covariance * dh/dx.T) <= 0
+
+        Here, we chose a different implementation to avoid the discontinuity of the sqrt, we instead decompose the two
+        terms, meaning that you have to declare the constraint h=0 and the "variation of h"=buffer ** 2 with
+        is_stochastic=True independently.
+        """
+
+        # TODO: Charbie -> This is just a first implementation (x=[q, qdot]), it should then be generalized
+
+        nx = controller.states["q"].cx_start.shape[0]
+        n_root = controller.model.nb_root
+        n_joints = nx - n_root
+
+        if "cholesky_cov" in controller.stochastic_variables.keys():
+            l_cov_matrix = StochasticBioModel.reshape_to_cholesky_matrix(
+                controller.stochastic_variables["cholesky_cov"].cx_start, controller.model.matrix_shape_cov_cholesky
+            )
+            cov_matrix = l_cov_matrix @ l_cov_matrix.T
+        else:
+            cov_matrix = StochasticBioModel.reshape_to_matrix(
+                controller.stochastic_variables["cov"].cx_start, controller.model.matrix_shape_cov
+            )
+
+        jac_fcn_states = jacobian(fcn, state_cx_scaled)
+        fcn_variation = jac_fcn_states @ cov_matrix @ jac_fcn_states.T
+
+        return diag(fcn_variation)
+
     def _set_penalty_function(
         self, controller: PenaltyController | list[PenaltyController, PenaltyController], fcn: MX | SX
     ):
@@ -396,14 +444,150 @@ class PenaltyOption(OptionGeneric):
             The control at a given time
             """
 
-            if controller.control_type == ControlType.CONSTANT:
+            if (
+                controller.control_type == ControlType.CONSTANT
+                or controller.control_type == ControlType.CONSTANT_WITH_LAST_NODE
+            ):
                 return u
             elif controller.control_type == ControlType.LINEAR_CONTINUOUS:
                 return u[:, 0] + (u[:, 1] - u[:, 0]) * dt
             else:
                 raise RuntimeError(f"{controller.control_type} ControlType not implemented yet")
 
-        if self.multinode_penalty or self.transition:
+        if self.transition:
+            name = (
+                self.name.replace("->", "_")
+                .replace(" ", "_")
+                .replace("(", "_")
+                .replace(")", "_")
+                .replace(",", "_")
+                .replace(":", "_")
+                .replace(".", "_")
+                .replace("__", "_")
+            )
+
+            if len(controller) != 2:
+                raise RuntimeError("Transition penalty must be between two nodes")
+
+            controllers = controller
+            controller = controllers[0]  # Recast controller as a normal variable (instead of a list)
+            ocp = controller.ocp
+            self.node_idx[0] = controller.node_index
+
+            self.all_nodes_index = []
+            for ctrl in controllers:
+                self.all_nodes_index.extend(ctrl.t)
+
+            # To deal with phases with uneven numbers of variables
+            if controllers[0].states_scaled.cx.shape[0] > controllers[1].states_scaled.cx.shape[0]:
+                fake = controllers[0].cx(
+                    controllers[0].states_scaled.cx.shape[0] - controllers[1].states_scaled.cx.shape[0], 1
+                )
+                state_cx_scaled = vertcat(controllers[1].states_scaled.cx, fake)
+            else:
+                state_cx_scaled = controllers[1].states_scaled.cx
+            if (
+                controllers[1].get_nlp.assume_phase_dynamics
+                or controllers[1].node_index < controllers[1].ns
+                or controllers[1].get_nlp.control_type != ControlType.CONSTANT
+            ):
+                if controllers[0].controls_scaled.cx.shape[0] > controllers[1].controls_scaled.cx.shape[0]:
+                    fake = controllers[0].cx(
+                        controllers[0].controls_scaled.cx.shape[0] - controllers[1].controls_scaled.cx.shape[0], 1
+                    )
+                    control_cx_scaled = vertcat(controllers[1].controls_scaled.cx, fake)
+                else:
+                    control_cx_scaled = controllers[1].controls_scaled.cx
+            else:
+                control_cx_scaled = controllers[0].cx()
+            if (
+                controllers[0].stochastic_variables_scaled.cx.shape[0]
+                > controllers[1].stochastic_variables_scaled.cx.shape[0]
+            ):
+                fake = controllers[0].cx(
+                    controllers[0].stochastic_variables_scaled.cx.shape[0]
+                    - controllers[1].stochastic_variables_scaled.cx.shape[0],
+                    1,
+                )
+                stochastic_cx_scaled = vertcat(controllers[1].stochastic_variables_scaled.cx, fake)
+            else:
+                stochastic_cx_scaled = controllers[1].stochastic_variables_scaled.cx
+
+            # To deal with cyclic phase transition in assume phase dynamics
+            if controllers[0].cx_index_to_get == 1:
+                if controllers[1].states_scaled.cx.shape[0] > controllers[0].states_scaled.cx.shape[0]:
+                    fake = controllers[0].cx(
+                        controllers[1].states_scaled.cx.shape[0] - controllers[0].states_scaled.cx.shape[0], 1
+                    )
+                    state_cx_scaled = vertcat(state_cx_scaled, controllers[0].states_scaled.cx, fake)
+                else:
+                    state_cx_scaled = vertcat(state_cx_scaled, controllers[0].states_scaled.cx)
+                if controllers[0].get_nlp.assume_phase_dynamics or controllers[0].node_index < controllers[0].ns:
+                    if controllers[1].controls_scaled.cx.shape[0] > controllers[0].controls_scaled.cx.shape[0]:
+                        fake = controllers[0].cx(
+                            controllers[1].controls_scaled.cx.shape[0] - controllers[0].controls_scaled.cx.shape[0], 1
+                        )
+                        control_cx_scaled = vertcat(control_cx_scaled, controllers[0].controls_scaled.cx, fake)
+                    else:
+                        control_cx_scaled = vertcat(control_cx_scaled, controllers[0].controls_scaled.cx)
+                if (
+                    controllers[1].stochastic_variables_scaled.cx.shape[0]
+                    > controllers[0].stochastic_variables_scaled.cx.shape[0]
+                ):
+                    fake = controllers[0].cx(
+                        controllers[1].stochastic_variables_scaled.cx.shape[0]
+                        - controllers[0].stochastic_variables_scaled.cx.shape[0],
+                        1,
+                    )
+                    stochastic_cx_scaled = vertcat(
+                        stochastic_cx_scaled, controllers[0].stochastic_variables_scaled.cx, fake
+                    )
+                else:
+                    stochastic_cx_scaled = vertcat(stochastic_cx_scaled, controllers[0].stochastic_variables_scaled.cx)
+            else:
+                if controllers[1].states_scaled.cx_start.shape[0] > controllers[0].states_scaled.cx_start.shape[0]:
+                    fake = controllers[0].cx(
+                        controllers[1].states_scaled.cx_start.shape[0] - controllers[0].states_scaled.cx_start.shape[0],
+                        1,
+                    )
+                    state_cx_scaled = vertcat(state_cx_scaled, controllers[0].states_scaled.cx_start, fake)
+                else:
+                    state_cx_scaled = vertcat(state_cx_scaled, controllers[0].states_scaled.cx_start)
+                if (
+                    controllers[0].get_nlp.assume_phase_dynamics
+                    or controllers[0].node_index < controllers[0].ns
+                    or controllers[1].get_nlp.control_type != ControlType.CONSTANT
+                ):
+                    if (
+                        controllers[1].controls_scaled.cx_start.shape[0]
+                        > controllers[0].controls_scaled.cx_start.shape[0]
+                    ):
+                        fake = controllers[0].cx(
+                            controllers[1].controls_scaled.cx_start.shape[0]
+                            - controllers[0].controls_scaled.cx_start.shape[0],
+                            1,
+                        )
+                        control_cx_scaled = vertcat(control_cx_scaled, controllers[0].controls_scaled.cx_start, fake)
+                    else:
+                        control_cx_scaled = vertcat(control_cx_scaled, controllers[0].controls_scaled.cx_start)
+                if (
+                    controllers[1].stochastic_variables_scaled.cx_start.shape[0]
+                    > controllers[0].stochastic_variables_scaled.cx_start.shape[0]
+                ):
+                    fake = controllers[0].cx(
+                        controllers[1].stochastic_variables_scaled.cx_start.shape[0]
+                        - controllers[0].stochastic_variables_scaled.cx_start.shape[0],
+                        1,
+                    )
+                    stochastic_cx_scaled = vertcat(
+                        stochastic_cx_scaled, controllers[0].stochastic_variables_scaled.cx_start, fake
+                    )
+                else:
+                    stochastic_cx_scaled = vertcat(
+                        stochastic_cx_scaled, controllers[0].stochastic_variables_scaled.cx_start
+                    )
+
+        elif self.multinode_penalty:
             from ..limits.multinode_constraint import MultinodeConstraint
 
             self: MultinodeConstraint
@@ -430,30 +614,58 @@ class PenaltyOption(OptionGeneric):
 
             state_cx_scaled = ocp.cx()
             control_cx_scaled = ocp.cx()
+            stochastic_cx_scaled = ocp.cx()
             for ctrl in controllers:
-                state_cx_scaled = vertcat(state_cx_scaled, ctrl.states_scaled.cx)
-                control_cx_scaled = vertcat(control_cx_scaled, ctrl.controls_scaled.cx)
+                if ctrl.node_index == controller.get_nlp.ns:
+                    state_cx_scaled = vertcat(state_cx_scaled, ctrl.states_scaled.cx_start)
+                    control_cx_scaled = vertcat(control_cx_scaled, ctrl.controls_scaled.cx_start)
+                    stochastic_cx_scaled = vertcat(stochastic_cx_scaled, ctrl.stochastic_variables_scaled.cx_start)
+                else:
+                    if (
+                        controller.ode_solver.is_direct_collocation
+                        and not self.derivative
+                        and self.integration_rule != QuadratureRule.APPROXIMATE_TRAPEZOIDAL
+                    ):
+                        state_cx_scaled = vertcat(
+                            state_cx_scaled, ctrl.states_scaled.cx_start, *ctrl.states_scaled.cx_intermediates_list
+                        )
+                    else:
+                        state_cx_scaled = vertcat(state_cx_scaled, ctrl.states_scaled.cx)
+                    control_cx_scaled = vertcat(control_cx_scaled, ctrl.controls_scaled.cx)
+                    stochastic_cx_scaled = vertcat(stochastic_cx_scaled, ctrl.stochastic_variables_scaled.cx)
 
         else:
             ocp = controller.ocp
             name = self.name
-            if self.integrate:
-                state_cx_scaled = horzcat(
-                    *([controller.states_scaled.cx_start] + controller.states_scaled.cx_intermediates_list)
-                )
-                control_cx_scaled = controller.controls_scaled.cx_start
-            else:
-                state_cx_scaled = controller.states_scaled.cx_start
-                control_cx_scaled = controller.controls_scaled.cx_start
+            state_cx_scaled = controller.states_scaled.cx_start
+            if controller.get_nlp.assume_phase_dynamics or controller.node_index < controller.ns:
+                if self.integrate or controller.ode_solver.is_direct_collocation:
+                    if not (len(self.node_idx) == 1 and self.node_idx[0] == controller.ns):
+                        if not self.derivative or self.integration_rule == QuadratureRule.APPROXIMATE_TRAPEZOIDAL:
+                            state_cx_scaled = vertcat(
+                                *([controller.states_scaled.cx_start] + controller.states_scaled.cx_intermediates_list)
+                            )
+            control_cx_scaled = controller.controls_scaled.cx_start
+            stochastic_cx_scaled = controller.stochastic_variables_scaled.cx_start
             if self.explicit_derivative:
                 if self.derivative:
                     raise RuntimeError("derivative and explicit_derivative cannot be simultaneously true")
-                state_cx_scaled = horzcat(state_cx_scaled, controller.states_scaled.cx_end)
-                control_cx_scaled = horzcat(control_cx_scaled, controller.controls_scaled.cx_end)
+                if controller.node_index < controller.ns:
+                    state_cx_scaled = vertcat(state_cx_scaled, controller.states_scaled.cx_end)
+                    if (
+                        not (
+                            self.node[0] == controller.ns - 1
+                            and ocp.nlp[self.phase].control_type == ControlType.CONSTANT
+                        )
+                        or ocp.assume_phase_dynamics
+                    ):
+                        control_cx_scaled = vertcat(control_cx_scaled, controller.controls_scaled.cx_end)
+                    # Watch out, there is nothing constraining stochastic_variables_scaled.cx_end to an actual value.
+                    stochastic_cx_scaled = vertcat(stochastic_cx_scaled, controller.stochastic_variables_scaled.cx_end)
 
         # Alias some variables
         node = controller.node_index
-        param_cx = controller.parameters.cx_start
+        param_cx = controller.parameters.cx
 
         # Sanity check on outputs
         if len(self.function) <= node:
@@ -463,29 +675,62 @@ class PenaltyOption(OptionGeneric):
                 self.function_non_threaded.append(None)
                 self.weighted_function_non_threaded.append(None)
 
-        # Do not use nlp.add_casadi_func because all functions must be registered
         sub_fcn = fcn[self.rows, self.cols]
+        if self.is_stochastic:
+            sub_fcn = self.transform_penalty_to_stochastic(controller, sub_fcn, state_cx_scaled)
+
+        # Do not use nlp.add_casadi_func because all functions must be registered
         self.function[node] = controller.to_casadi_func(
-            name, sub_fcn, state_cx_scaled, control_cx_scaled, param_cx, expand=self.expand
+            name,
+            sub_fcn,
+            state_cx_scaled,
+            control_cx_scaled,
+            param_cx,
+            stochastic_cx_scaled,
+            expand=self.expand,
         )
         self.function_non_threaded[node] = self.function[node]
 
         if self.derivative:
-            state_cx_scaled = horzcat(controller.states_scaled.cx_end, controller.states_scaled.cx_start)
-            control_cx_scaled = horzcat(controller.controls_scaled.cx_end, controller.controls_scaled.cx_start)
+            if controller.get_nlp.ode_solver.is_direct_collocation and node != ocp.nlp[self.phase].ns:
+                state_cx_scaled = vertcat(
+                    *(
+                        [controller.states_scaled.cx_end]
+                        + [controller.states_scaled.cx_start]
+                        + controller.states_scaled.cx_intermediates_list
+                    )
+                )
+            else:
+                state_cx_scaled = vertcat(controller.states_scaled.cx_end, controller.states_scaled.cx_start)
+            if (
+                not (node == ocp.nlp[self.phase].ns and ocp.nlp[self.phase].control_type == ControlType.CONSTANT)
+                or ocp.assume_phase_dynamics
+            ):
+                control_cx_scaled = vertcat(controller.controls_scaled.cx_end, controller.controls_scaled.cx_start)
             self.function[node] = biorbd.to_casadi_func(
                 f"{name}",
-                self.function[node](controller.states_scaled.cx_end, controller.controls_scaled.cx_end, param_cx)
-                - self.function[node](controller.states_scaled.cx_start, controller.controls_scaled.cx_start, param_cx),
+                self.function[node](
+                    controller.states_scaled.cx_end,
+                    controller.controls_scaled.cx_end,
+                    param_cx,
+                    controller.stochastic_variables_scaled.cx_start,
+                )
+                - self.function[node](
+                    controller.states_scaled.cx_start,
+                    controller.controls_scaled.cx_start,
+                    param_cx,
+                    controller.stochastic_variables_scaled.cx_start,  # Warning: stochastic_variables.cx_end are not implemented
+                ),
                 state_cx_scaled,
                 control_cx_scaled,
                 param_cx,
+                stochastic_cx_scaled,
             )
 
         dt_cx = controller.cx.sym("dt", 1, 1)
         is_trapezoidal = (
-            self.integration_rule == IntegralApproximation.TRAPEZOIDAL
-            or self.integration_rule == IntegralApproximation.TRUE_TRAPEZOIDAL
+            self.integration_rule == QuadratureRule.APPROXIMATE_TRAPEZOIDAL
+            or self.integration_rule == QuadratureRule.TRAPEZOIDAL
         )
         target_shape = tuple(
             [
@@ -501,64 +746,121 @@ class PenaltyOption(OptionGeneric):
             # Hypothesis: the function is continuous on states
             # it neglects the discontinuities at the beginning of the optimization
             state_cx_scaled = (
-                horzcat(controller.states_scaled.cx_start, controller.states_scaled.cx_end)
-                if self.integration_rule == IntegralApproximation.TRAPEZOIDAL
+                vertcat(controller.states_scaled.cx_start, controller.states_scaled.cx_end)
+                if self.integration_rule == QuadratureRule.APPROXIMATE_TRAPEZOIDAL
                 else controller.states_scaled.cx_start
             )
             state_cx = (
-                horzcat(controller.states.cx_start, controller.states.cx_end)
-                if self.integration_rule == IntegralApproximation.TRAPEZOIDAL
+                vertcat(controller.states.cx_start, controller.states.cx_end)
+                if self.integration_rule == QuadratureRule.APPROXIMATE_TRAPEZOIDAL
                 else controller.states.cx_start
             )
             # to handle piecewise constant in controls we have to compute the value for the end of the interval
             # which only relies on the value of the control at the beginning of the interval
             control_cx_scaled = (
-                horzcat(controller.controls_scaled.cx_start)
-                if controller.control_type == ControlType.CONSTANT
-                else horzcat(controller.controls_scaled.cx_start, controller.controls_scaled.cx_end)
+                controller.controls_scaled.cx_start
+                if controller.control_type in (ControlType.CONSTANT, ControlType.CONSTANT_WITH_LAST_NODE)
+                else vertcat(controller.controls_scaled.cx_start, controller.controls_scaled.cx_end)
             )
-            control_cx = (
-                horzcat(controller.controls.cx_start)
-                if controller.control_type == ControlType.CONSTANT
-                else horzcat(controller.controls.cx_start, controller.controls.cx_end)
-            )
-            control_cx_end_scaled = get_u(control_cx_scaled, dt_cx)
-            control_cx_end = get_u(control_cx, dt_cx)
+
+            if controller.control_type in (ControlType.CONSTANT, ControlType.CONSTANT_WITH_LAST_NODE):
+                control_cx_end_scaled = get_u(controller.controls_scaled.cx_start, dt_cx)
+                control_cx_end = get_u(controller.controls.cx_start, dt_cx)
+            else:
+                control_cx_end_scaled = get_u(
+                    horzcat(controller.controls_scaled.cx_start, controller.controls_scaled.cx_end), dt_cx
+                )
+                control_cx_end = get_u(horzcat(controller.controls.cx_start, controller.controls.cx_end), dt_cx)
             state_cx_end_scaled = (
                 controller.states_scaled.cx_end
-                if self.integration_rule == IntegralApproximation.TRAPEZOIDAL
-                else controller.integrate(x0=state_cx, p=control_cx_end, params=controller.parameters.cx_start)["xf"]
+                if self.integration_rule == QuadratureRule.APPROXIMATE_TRAPEZOIDAL
+                else controller.integrate(
+                    x0=state_cx,
+                    p=control_cx_end,
+                    params=controller.parameters.cx,
+                    s=controller.stochastic_variables.cx_start,
+                )["xf"]
             )
+            if controller.ode_solver.is_direct_collocation:
+                state_cx_start_scaled = vertcat(
+                    controller.states_scaled.cx_start, *controller.states_scaled.cx_intermediates_list
+                )
+                state_cx_end_scaled = vertcat(
+                    state_cx_end_scaled,
+                    *controller.states_scaled.cx_intermediates_list,
+                )
+            else:
+                state_cx_start_scaled = controller.states_scaled.cx_start
+
+            stochastic_cx_scaled = controller.stochastic_variables_scaled.cx_start
+
             modified_function = controller.to_casadi_func(
                 f"{name}",
                 (
                     (
                         self.function[node](
-                            controller.states_scaled.cx_start, controller.controls_scaled.cx_start, param_cx
+                            state_cx_start_scaled,
+                            controller.controls_scaled.cx_start,
+                            param_cx,
+                            controller.stochastic_variables_scaled.cx_start,
                         )
                         - target_cx[:, 0]
                     )
                     ** exponent
-                    + (self.function[node](state_cx_end_scaled, control_cx_end_scaled, param_cx) - target_cx[:, 1])
+                    + (
+                        self.function[node](
+                            state_cx_end_scaled,
+                            control_cx_end_scaled,
+                            param_cx,
+                            stochastic_cx_scaled,
+                        )
+                        - target_cx[:, 1]
+                    )
                     ** exponent
                 )
                 / 2,
                 state_cx_scaled,
                 control_cx_scaled,
                 param_cx,
+                stochastic_cx_scaled,
                 target_cx,
                 dt_cx,
             )
-            modified_fcn = modified_function(state_cx_scaled, control_cx_scaled, param_cx, target_cx, dt_cx)
+            modified_fcn = modified_function(
+                state_cx_scaled,
+                control_cx_scaled,
+                param_cx,
+                stochastic_cx_scaled,
+                target_cx,
+                dt_cx,
+            )
         else:
-            modified_fcn = (self.function[node](state_cx_scaled, control_cx_scaled, param_cx) - target_cx) ** exponent
+            modified_fcn = (
+                self.function[node](
+                    state_cx_scaled,
+                    control_cx_scaled,
+                    param_cx,
+                    stochastic_cx_scaled,
+                )
+                - target_cx
+            ) ** exponent
 
         # for the future bioptim adventurer: here lies the reason that a constraint must have weight = 0.
         modified_fcn = weight_cx * modified_fcn * dt_cx if self.weight else modified_fcn * dt_cx
 
         # Do not use nlp.add_casadi_func because all of them must be registered
         self.weighted_function[node] = Function(
-            name, [state_cx_scaled, control_cx_scaled, param_cx, weight_cx, target_cx, dt_cx], [modified_fcn]
+            name,
+            [
+                state_cx_scaled,
+                control_cx_scaled,
+                param_cx,
+                stochastic_cx_scaled,
+                weight_cx,
+                target_cx,
+                dt_cx,
+            ],
+            [modified_fcn],
         )
         self.weighted_function_non_threaded[node] = self.weighted_function[node]
 
@@ -612,7 +914,7 @@ class PenaltyOption(OptionGeneric):
 
         """
 
-        def plot_function(t, x, u, p, penalty=None):
+        def plot_function(t, x, u, p, s, penalty=None):
             if isinstance(t, (list, tuple)):
                 return self.target_to_plot[:, [self.node_idx.index(_t) for _t in t]]
             else:
@@ -663,10 +965,10 @@ class PenaltyOption(OptionGeneric):
             self.multinode_idx = []
             for node, phase_idx in zip(self.nodes, self.nodes_phase):
                 self.node = node
-                nlp = ocp.nlp[phase_idx % ocp.n_phases]
+                nlp = ocp.nlp[phase_idx % ocp.n_phases]  # this is to allow using -1 to refer to the last phase
 
                 controllers.append(self._get_penalty_controller(ocp, nlp))
-                if self.node == Node.END or self.node == nlp.ns:
+                if (self.node[0] == Node.END or self.node[0] == nlp.ns) and nlp.U != []:
                     # Make an exception to the fact that U is not available for the last node
                     controllers[-1].u = [nlp.U[-1]]
                 penalty_type.validate_penalty_time_index(self, controllers[-1])
@@ -686,8 +988,8 @@ class PenaltyOption(OptionGeneric):
             self.node_idx = (
                 controllers[0].t[:-1]
                 if (
-                    self.integration_rule == IntegralApproximation.TRAPEZOIDAL
-                    or self.integration_rule == IntegralApproximation.TRUE_TRAPEZOIDAL
+                    self.integration_rule == QuadratureRule.APPROXIMATE_TRAPEZOIDAL
+                    or self.integration_rule == QuadratureRule.TRAPEZOIDAL
                 )
                 and self.target is not None
                 else controllers[0].t
@@ -797,6 +1099,10 @@ class PenaltyOption(OptionGeneric):
 
         x = [nlp.X[idx] for idx in t]
         x_scaled = [nlp.X_scaled[idx] for idx in t]
-        u = [nlp.U[idx] for idx in t if idx != nlp.ns]
-        u_scaled = [nlp.U_scaled[idx] for idx in t if idx != nlp.ns]
-        return PenaltyController(ocp, nlp, t, x, u, x_scaled, u_scaled, nlp.parameters.cx_start)
+        u, u_scaled = [], []
+        if nlp.U is not None and (not isinstance(nlp.U, list) or nlp.U != []):
+            u = [nlp.U[idx] for idx in t if idx != nlp.ns]
+            u_scaled = [nlp.U_scaled[idx] for idx in t if idx != nlp.ns]
+        s = [nlp.S[idx] for idx in t]
+        s_scaled = [nlp.S_scaled[idx] for idx in t]
+        return PenaltyController(ocp, nlp, t, x, u, x_scaled, u_scaled, nlp.parameters.cx, s, s_scaled)

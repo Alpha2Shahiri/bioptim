@@ -49,7 +49,7 @@ class InterpolationType(Enum):
     CONSTANT_WITH_FIRST_AND_LAST_DIFFERENT = 1  # All values are set, with the first and last defined to another one
     LINEAR = 2  # Linear interpolation between first and last
     EACH_FRAME = 3  # Each value is provided by the user
-    ALL_POINTS = 4  # Values at all collocation points are provided by the user
+    ALL_POINTS = 4  # If in direct collocation, it is at all collocation points, otherwise it acts as EACH_FRAME
     SPLINE = 5  # Cubic spline interpolation
     CUSTOM = 6  # Interpolation via a used-defined custom function
 
@@ -94,9 +94,10 @@ class ControlType(Enum):
     The goto value is CONSTANT
     """
 
-    CONSTANT = 1  # Constant over the integration step (=1 column)
+    CONSTANT = 1  # Constant over the integration step, the last node is a NaN (=1 column)
     LINEAR_CONTINUOUS = 2  # Linear interpolation between integration steps (=2 columns)
     NONE = 0  # Undeclared control type
+    CONSTANT_WITH_LAST_NODE = 3  # Constant over the integration step, the last node exists (=1 columns)
 
 
 class VariableType(Enum):
@@ -106,6 +107,9 @@ class VariableType(Enum):
 
     STATES = "states"
     CONTROLS = "controls"
+    STATES_DOT = "states_dot"
+    ALGEBRAIC = "algebraic"
+    STOCHASTIC = "stochastic"
 
 
 class SolutionIntegrator(Enum):
@@ -138,15 +142,17 @@ class ConstraintType(Enum):
     IMPLICIT = "implicit"
 
 
-class IntegralApproximation(Enum):
+class QuadratureRule(Enum):
     """
-    Selection of integral approximation
+    Selection of quadrature rule to approximate integrals.
     """
 
     DEFAULT = "default"
-    RECTANGLE = "rectangle"
+    RECTANGLE_LEFT = "rectangle_left"
+    RECTANGLE_RIGHT = "rectangle_right"
+    MIDPOINT = "midpoint"
+    APPROXIMATE_TRAPEZOIDAL = "approximate_trapezoidal"
     TRAPEZOIDAL = "trapezoidal"
-    TRUE_TRAPEZOIDAL = "true_trapezoidal"
 
 
 class SoftContactDynamics(Enum):

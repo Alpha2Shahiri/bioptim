@@ -103,55 +103,55 @@ def generate_data(
 
     for node_index in range(n_shooting):
         nlp.states.append(
-            "q",
-            [symbolic_q, symbolic_q, symbolic_q],
-            [symbolic_q, symbolic_q, symbolic_q],
-            symbolic_q,
-            nlp.variable_mappings["q"],
-            node_index,
+            name="q",
+            cx=[symbolic_q, symbolic_q, symbolic_q],
+            cx_scaled=[symbolic_q, symbolic_q, symbolic_q],
+            mx=symbolic_q,
+            mapping=nlp.variable_mappings["q"],
+            node_index=node_index,
         )
         nlp.states.append(
-            "qdot",
-            [symbolic_qdot, symbolic_qdot, symbolic_qdot],
-            [symbolic_qdot, symbolic_qdot, symbolic_qdot],
-            symbolic_qdot,
-            nlp.variable_mappings["qdot"],
-            node_index,
+            name="qdot",
+            cx=[symbolic_qdot, symbolic_qdot, symbolic_qdot],
+            cx_scaled=[symbolic_qdot, symbolic_qdot, symbolic_qdot],
+            mx=symbolic_qdot,
+            mapping=nlp.variable_mappings["qdot"],
+            node_index=node_index,
         )
 
         nlp.states_dot.append(
-            "qdot",
-            [symbolic_qdot, symbolic_qdot, symbolic_qdot],
-            [symbolic_qdot, symbolic_qdot, symbolic_qdot],
-            symbolic_qdot,
-            nlp.variable_mappings["qdot"],
-            node_index,
+            name="qdot",
+            cx=[symbolic_qdot, symbolic_qdot, symbolic_qdot],
+            cx_scaled=[symbolic_qdot, symbolic_qdot, symbolic_qdot],
+            mx=symbolic_qdot,
+            mapping=nlp.variable_mappings["qdot"],
+            node_index=node_index,
         )
         nlp.states_dot.append(
-            "qddot",
-            [symbolic_qddot, symbolic_qddot, symbolic_qddot],
-            [symbolic_qddot, symbolic_qddot, symbolic_qddot],
-            symbolic_qddot,
-            nlp.variable_mappings["qddot"],
-            node_index,
+            name="qddot",
+            cx=[symbolic_qddot, symbolic_qddot, symbolic_qddot],
+            cx_scaled=[symbolic_qddot, symbolic_qddot, symbolic_qddot],
+            mx=symbolic_qddot,
+            mapping=nlp.variable_mappings["qddot"],
+            node_index=node_index,
         )
 
         if use_residual_torque:
             nlp.controls.append(
-                "tau",
-                [symbolic_tau, symbolic_tau, symbolic_tau],
-                [symbolic_tau, symbolic_tau, symbolic_tau],
-                symbolic_tau,
-                nlp.variable_mappings["tau"],
-                node_index,
+                name="tau",
+                cx=[symbolic_tau, symbolic_tau, symbolic_tau],
+                cx_scaled=[symbolic_tau, symbolic_tau, symbolic_tau],
+                mx=symbolic_tau,
+                mapping=nlp.variable_mappings["tau"],
+                node_index=node_index,
             )
         nlp.controls.append(
-            "muscles",
-            [symbolic_mus, symbolic_mus, symbolic_mus],
-            [symbolic_mus, symbolic_mus, symbolic_mus],
-            symbolic_mus,
-            nlp.variable_mappings["muscles"],
-            node_index,
+            name="muscles",
+            cx=[symbolic_mus, symbolic_mus, symbolic_mus],
+            cx_scaled=[symbolic_mus, symbolic_mus, symbolic_mus],
+            mx=symbolic_mus,
+            mapping=nlp.variable_mappings["muscles"],
+            node_index=node_index,
         )
 
     if use_residual_torque:
@@ -167,6 +167,7 @@ def generate_data(
             states=symbolic_states,
             controls=symbolic_controls,
             parameters=symbolic_parameters,
+            stochastic_variables=MX(),
             nlp=nlp,
             with_contact=False,
             rigidbody_dynamics=RigidBodyDynamics.ODE,
@@ -218,6 +219,7 @@ def prepare_ocp(
     ode_solver: OdeSolverBase = OdeSolver.COLLOCATION(),
     n_threads: int = 1,
     assume_phase_dynamics: bool = True,
+    expand_dynamics: bool = True,
 ) -> OptimalControlProgram:
     """
     Prepare the ocp to solve
@@ -248,6 +250,10 @@ def prepare_ocp(
         If the dynamics equation within a phase is unique or changes at each node. True is much faster, but lacks the
         capability to have changing dynamics within a phase. A good example of when False should be used is when
         different external forces are applied at each node
+    expand_dynamics: bool
+        If the dynamics function should be expanded. Please note, this will solve the problem faster, but will slow down
+        the declaration of the OCP, so it is a trade-off. Also depending on the solver, it may or may not work
+        (for instance IRK is not compatible with expanded dynamics)
 
     Returns
     -------
@@ -270,19 +276,13 @@ def prepare_ocp(
 
     # Dynamics
     dynamics = DynamicsList()
-    dynamics.add(DynamicsFcn.MUSCLE_DRIVEN, with_residual_torque=use_residual_torque)
+    dynamics.add(DynamicsFcn.MUSCLE_DRIVEN, with_residual_torque=use_residual_torque, expand=expand_dynamics)
 
     # Path constraint
     x_bounds = BoundsList()
-    x_bounds.add(bounds=bio_model.bounds_from_ranges(["q", "qdot"]))
+    x_bounds["q"] = [-2 * np.pi] * bio_model.nb_q, [2 * np.pi] * bio_model.nb_q
     # Due to unpredictable movement of the forward dynamics that generated the movement, the bound must be larger
-    nq = bio_model.nb_q
-    x_bounds[0].min[:nq, :] = -2 * np.pi
-    x_bounds[0].max[:nq, :] = 2 * np.pi
-
-    # Initial guess
-    x_init = InitialGuessList()
-    x_init.add([0] * (bio_model.nb_q + bio_model.nb_qdot))
+    x_bounds["qdot"] = bio_model.bounds_from_ranges("qdot")
 
     # Define control path constraint
     activation_min, activation_max, activation_init = 0.0, 1.0, 0.5
@@ -290,17 +290,9 @@ def prepare_ocp(
     u_init = InitialGuessList()
     if use_residual_torque:
         tau_min, tau_max, tau_init = -100.0, 100.0, 0.0
-        u_bounds.add(
-            [tau_min] * bio_model.nb_tau + [activation_min] * bio_model.nb_muscles,
-            [tau_max] * bio_model.nb_tau + [activation_max] * bio_model.nb_muscles,
-        )
-        u_init.add([tau_init] * bio_model.nb_tau + [activation_init] * bio_model.nb_muscles)
-    else:
-        u_bounds.add(
-            [activation_min] * bio_model.nb_muscles,
-            [activation_max] * bio_model.nb_muscles,
-        )
-        u_init.add([activation_init] * bio_model.nb_muscles)
+        u_bounds["tau"] = [tau_min] * bio_model.nb_tau, [tau_max] * bio_model.nb_tau
+    u_bounds["muscles"] = [activation_min] * bio_model.nb_muscles, [activation_max] * bio_model.nb_muscles
+    u_init["muscles"] = [activation_init] * bio_model.nb_muscles
     # ------------- #
 
     return OptimalControlProgram(
@@ -308,11 +300,10 @@ def prepare_ocp(
         dynamics,
         n_shooting,
         final_time,
-        x_init,
-        u_init,
-        x_bounds,
-        u_bounds,
-        objective_functions,
+        x_bounds=x_bounds,
+        u_bounds=u_bounds,
+        u_init=u_init,
+        objective_functions=objective_functions,
         ode_solver=ode_solver,
         n_threads=n_threads,
         assume_phase_dynamics=assume_phase_dynamics,

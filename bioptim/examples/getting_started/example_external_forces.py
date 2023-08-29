@@ -34,7 +34,9 @@ from bioptim import (
 
 
 def prepare_ocp(
-    biorbd_model_path: str = "models/cube_with_forces.bioMod", ode_solver: OdeSolverBase = OdeSolver.RK4()
+    biorbd_model_path: str = "models/cube_with_forces.bioMod",
+    ode_solver: OdeSolverBase = OdeSolver.RK4(),
+    expand_dynamics: bool = True,
 ) -> OptimalControlProgram:
     """
     Prepare the ocp
@@ -45,6 +47,10 @@ def prepare_ocp(
         The path to the bioMod
     ode_solver: OdeSolverBase
         The ode solver to use
+    expand_dynamics: bool
+        If the dynamics function should be expanded. Please note, this will solve the problem faster, but will slow down
+        the declaration of the OCP, so it is a trade-off. Also depending on the solver, it may or may not work
+        (for instance IRK is not compatible with expanded dynamics)
 
     Returns
     -------
@@ -63,8 +69,7 @@ def prepare_ocp(
 
     # Dynamics
     dynamics = DynamicsList()
-    expand = False if isinstance(ode_solver, OdeSolver.IRK) else True
-    dynamics.add(DynamicsFcn.TORQUE_DRIVEN, expand=expand)
+    dynamics.add(DynamicsFcn.TORQUE_DRIVEN, expand=expand_dynamics)
 
     # Constraints
     constraints = ConstraintList()
@@ -78,30 +83,23 @@ def prepare_ocp(
 
     # Path constraint
     x_bounds = BoundsList()
-    x_bounds.add(bounds=bio_model.bounds_from_ranges(["q", "qdot"]))
-    x_bounds[0][3:6, [0, -1]] = 0
-
-    # Initial guess
-    x_init = InitialGuessList()
-    x_init.add([0] * (bio_model.nb_q + bio_model.nb_qdot))
+    x_bounds["q"] = bio_model.bounds_from_ranges("q")
+    x_bounds["q"][3, [0, -1]] = 0
+    x_bounds["qdot"] = bio_model.bounds_from_ranges("qdot")
+    x_bounds["qdot"][:3, [0, -1]] = 0
 
     # Define control path constraint
     u_bounds = BoundsList()
-    tau_min, tau_max, tau_init = -100, 100, 0
-    u_bounds.add([tau_min] * bio_model.nb_tau, [tau_max] * bio_model.nb_tau)
-
-    u_init = InitialGuessList()
-    u_init.add([tau_init] * bio_model.nb_tau)
+    tau_min, tau_max = -100, 100
+    u_bounds["tau"] = [tau_min] * bio_model.nb_tau, [tau_max] * bio_model.nb_tau
 
     return OptimalControlProgram(
         bio_model,
         dynamics,
         n_shooting,
         final_time,
-        x_init,
-        u_init,
-        x_bounds,
-        u_bounds,
+        x_bounds=x_bounds,
+        u_bounds=u_bounds,
         objective_functions=objective_functions,
         constraints=constraints,
         external_forces=external_forces,

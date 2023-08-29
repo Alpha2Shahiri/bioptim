@@ -18,8 +18,7 @@ from bioptim import (
     DynamicsFcn,
     ObjectiveFcn,
     ObjectiveList,
-    Bounds,
-    InitialGuess,
+    BoundsList,
     OdeSolver,
     OdeSolverBase,
     PenaltyController,
@@ -68,7 +67,10 @@ def custom_func_track_markers(controller: PenaltyController, first_marker: str, 
 
 
 def prepare_ocp(
-    biorbd_model_path, ode_solver: OdeSolverBase = OdeSolver.RK4(), assume_phase_dynamics: bool = True
+    biorbd_model_path,
+    ode_solver: OdeSolverBase = OdeSolver.RK4(),
+    assume_phase_dynamics: bool = True,
+    expand_dynamics: bool = True,
 ) -> OptimalControlProgram:
     """
     Prepare the program
@@ -83,6 +85,10 @@ def prepare_ocp(
         If the dynamics equation within a phase is unique or changes at each node. True is much faster, but lacks the
         capability to have changing dynamics within a phase. A good example of when False should be used is when
         different external forces are applied at each node
+    expand_dynamics: bool
+        If the dynamics function should be expanded. Please note, this will solve the problem faster, but will slow down
+        the declaration of the OCP, so it is a trade-off. Also depending on the solver, it may or may not work
+        (for instance IRK is not compatible with expanded dynamics)
 
     Returns
     -------
@@ -123,20 +129,20 @@ def prepare_ocp(
     )
 
     # Dynamics
-    dynamics = Dynamics(DynamicsFcn.TORQUE_DRIVEN)
+    dynamics = Dynamics(DynamicsFcn.TORQUE_DRIVEN, expand=expand_dynamics)
 
     # Path constraint
-    x_bounds = bio_model.bounds_from_ranges(["q", "qdot"])
-    x_bounds[1:6, [0, -1]] = 0
-    x_bounds[2, -1] = 1.57
-
-    # Initial guess
-    x_init = InitialGuess([0] * (bio_model.nb_q + bio_model.nb_qdot))
+    x_bounds = BoundsList()
+    x_bounds.add("q", bio_model.bounds_from_ranges("q"))
+    x_bounds.add("qdot", bio_model.bounds_from_ranges("qdot"))
+    x_bounds["q"][1:, [0, -1]] = 0
+    x_bounds["q"][2, -1] = 1.57
+    x_bounds["qdot"][:, [0, -1]] = 0
 
     # Define control path constraint
-    u_bounds = Bounds([tau_min] * bio_model.nb_tau, [tau_max] * bio_model.nb_tau)
-
-    u_init = InitialGuess([tau_init] * bio_model.nb_tau)
+    tau_min, tau_max = -100, 100
+    u_bounds = BoundsList()
+    u_bounds.add("tau", min_bound=[tau_min] * bio_model.nb_tau, max_bound=[tau_max] * bio_model.nb_tau)
 
     # ------------- #
 
@@ -145,11 +151,9 @@ def prepare_ocp(
         dynamics,
         n_shooting,
         final_time,
-        x_init,
-        u_init,
-        x_bounds,
-        u_bounds,
-        objective_functions,
+        x_bounds=x_bounds,
+        u_bounds=u_bounds,
+        objective_functions=objective_functions,
         ode_solver=ode_solver,
         assume_phase_dynamics=assume_phase_dynamics,
     )

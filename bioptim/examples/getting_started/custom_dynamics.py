@@ -22,8 +22,7 @@ from bioptim import (
     ObjectiveFcn,
     ConstraintList,
     ConstraintFcn,
-    Bounds,
-    InitialGuess,
+    BoundsList,
     OdeSolver,
     OdeSolverBase,
     NonLinearProgram,
@@ -32,10 +31,11 @@ from bioptim import (
 )
 
 
-def custom_dynamic(
+def custom_dynamics(
     states: MX | SX,
     controls: MX | SX,
     parameters: MX | SX,
+    stochastic_variables: MX | SX,
     nlp: NonLinearProgram,
     my_additional_factor=1,
 ) -> DynamicsEvaluation:
@@ -93,7 +93,7 @@ def custom_configure(ocp: OptimalControlProgram, nlp: NonLinearProgram, my_addit
     ConfigureProblem.configure_q(ocp, nlp, as_states=True, as_controls=False)
     ConfigureProblem.configure_qdot(ocp, nlp, as_states=True, as_controls=False)
     ConfigureProblem.configure_tau(ocp, nlp, as_states=False, as_controls=True)
-    ConfigureProblem.configure_dynamics_function(ocp, nlp, custom_dynamic, my_additional_factor=my_additional_factor)
+    ConfigureProblem.configure_dynamics_function(ocp, nlp, custom_dynamics, my_additional_factor=my_additional_factor)
 
 
 def prepare_ocp(
@@ -102,6 +102,7 @@ def prepare_ocp(
     ode_solver: OdeSolverBase = OdeSolver.RK4(),
     use_sx: bool = False,
     assume_phase_dynamics: bool = True,
+    expand_dynamics: bool = True,
 ) -> OptimalControlProgram:
     """
     Prepare the program
@@ -121,6 +122,10 @@ def prepare_ocp(
         If the dynamics equation within a phase is unique or changes at each node. True is much faster, but lacks the
         capability to have changing dynamics within a phase. A good example of when False should be used is when
         different external forces are applied at each node
+    expand_dynamics: bool
+        If the dynamics function should be expanded. Please note, this will solve the problem faster, but will slow down
+        the declaration of the OCP, so it is a trade-off. Also depending on the solver, it may or may not work
+        (for instance IRK is not compatible with expanded dynamics)
 
     Returns
     -------
@@ -140,11 +145,10 @@ def prepare_ocp(
 
     # Dynamics
     dynamics = DynamicsList()
-    expand = False if isinstance(ode_solver, OdeSolver.IRK) else True
     if problem_type_custom:
-        dynamics.add(custom_configure, dynamic_function=custom_dynamic, my_additional_factor=1, expand=expand)
+        dynamics.add(custom_configure, dynamic_function=custom_dynamics, my_additional_factor=1, expand=expand_dynamics)
     else:
-        dynamics.add(DynamicsFcn.TORQUE_DRIVEN, dynamic_function=custom_dynamic, expand=expand)
+        dynamics.add(DynamicsFcn.TORQUE_DRIVEN, dynamic_function=custom_dynamics, expand=expand_dynamics)
 
     # Constraints
     constraints = ConstraintList()
@@ -152,18 +156,17 @@ def prepare_ocp(
     constraints.add(ConstraintFcn.SUPERIMPOSE_MARKERS, node=Node.END, first_marker="m0", second_marker="m2")
 
     # Path constraint
-    x_bounds = bio_model.bounds_from_ranges(["q", "qdot"])
-    x_bounds[1:6, [0, -1]] = 0
-    x_bounds[2, -1] = 1.57
-
-    # Initial guess
-    x_init = InitialGuess([0] * (bio_model.nb_q + bio_model.nb_qdot))
+    x_bounds = BoundsList()
+    x_bounds.add("q", bio_model.bounds_from_ranges("q"))
+    x_bounds.add("qdot", bio_model.bounds_from_ranges("qdot"))
+    x_bounds["q"][1:, [0, -1]] = 0
+    x_bounds["q"][2, -1] = 1.57
+    x_bounds["qdot"][:, [0, -1]] = 0
 
     # Define control path constraint
-    tau_min, tau_max, tau_init = -100, 100, 0
-    u_bounds = Bounds([tau_min] * bio_model.nb_tau, [tau_max] * bio_model.nb_tau)
-
-    u_init = InitialGuess([tau_init] * bio_model.nb_tau)
+    tau_min, tau_max = -100, 100
+    u_bounds = BoundsList()
+    u_bounds.add("tau", min_bound=[tau_min] * bio_model.nb_tau, max_bound=[tau_max] * bio_model.nb_tau)
 
     # ------------- #
 
@@ -172,12 +175,10 @@ def prepare_ocp(
         dynamics,
         n_shooting,
         final_time,
-        x_init,
-        u_init,
-        x_bounds,
-        u_bounds,
-        objective_functions,
-        constraints,
+        x_bounds=x_bounds,
+        u_bounds=u_bounds,
+        objective_functions=objective_functions,
+        constraints=constraints,
         ode_solver=ode_solver,
         use_sx=use_sx,
         assume_phase_dynamics=assume_phase_dynamics,
